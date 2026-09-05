@@ -1,0 +1,50 @@
+{
+  "label": "SYNTHETIC DEMO DATA - NOT REAL PATIENT DATA",
+  "patient": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "external_id": "SYNTH-RAKSHA-001",
+    "full_name": "Asha Devi",
+    "date_of_birth": "1986-04-12",
+    "sex": "FEMALE",
+    "village": "Rampur",
+    "district": "Sitapur",
+    "state": "Uttar Pradesh",
+    "preferred_language": "hi",
+    "synthetic_label": true
+  },
+  "organizations": [
+    {
+      "id": "00000000-0000-4000-8000-000000000101",
+      "name": "Rampur Primary Health Centre",
+      "organization_type": "PRIMARY_HEALTH_CENTER",
+      "district": "Sitapur",
+      "state": "Uttar Pradesh"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000102",
+      "name": "Sitapur District Hospital",
+      "organization_type": "DISTRICT_HOSPITAL",
+      "district": "Sitapur",
+      "state": "Uttar Pradesh"
+    }
+  ],
+  "journey_ids": {
+    "registration_encounter_id": "00000000-0000-4000-8000-000000000201",
+    "triage_encounter_id": "00000000-0000-4000-8000-000000000202",
+    "symptom_report_id": "00000000-0000-4000-8000-000000000301",
+    "appointment_id": "00000000-0000-4000-8000-000000000401",
+    "referral_id": "00000000-0000-4000-8000-000000000501",
+    "diagnostic_request_id": "00000000-0000-4000-8000-000000000601",
+    "diagnostic_report_id": "00000000-0000-4000-8000-000000000602",
+    "care_plan_id": "00000000-0000-4000-8000-000000000701",
+    "follow_up_id": "00000000-0000-4000-8000-000000000801"
+  },
+  "initial_statuses": {
+    "appointment": "REQUESTED",
+    "referral": "CREATED",
+    "follow_up": "PENDING",
+    "sync": "PENDING"
+  },
+  "clinical_safety_note": "Synthetic seed data is for workflow demonstration only and is not clinical validation."
+}
+

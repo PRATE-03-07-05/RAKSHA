@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: raksha-postgres
+    environment:
+      POSTGRES_DB: raksha
+      POSTGRES_USER: raksha
+      POSTGRES_PASSWORD: raksha_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - raksha-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raksha -d raksha"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  raksha-postgres-data:
+
