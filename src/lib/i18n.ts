@@ -16,7 +16,7 @@ const D = {
   logout: { en: "Sign out", hi: "साइन आउट", mr: "साइन आउट" },
   email: { en: "Email", hi: "ईमेल", mr: "ईमेल" },
   password: { en: "Password", hi: "पासवर्ड", mr: "पासवर्ड" },
-  demoAccounts: { en: "SIH Demo Logins", hi: "SIH डेमो लॉगिन", mr: "SIH डेमो लॉगिन" },
+  demoAccounts: { en: "Demo Logins", hi: "डेमो लॉगिन", mr: "डेमो लॉगिन" },
   demoNote: { en: "One tap — each role has real permissions.", hi: "एक टैप — हर भूमिका को वास्तविक अनुमति है।", mr: "एक टॅप — प्रत्येक भूमिकेस खऱ्या परवानग्या." },
   online: { en: "Online", hi: "ऑनलाइन", mr: "ऑनलाइन" },
   offline: { en: "Offline", hi: "ऑफ़लाइन", mr: "ऑफलाइन" },

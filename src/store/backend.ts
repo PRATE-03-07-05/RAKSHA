@@ -2,7 +2,7 @@
  * RAKSHA service layer.
  *
  * In production this is the FastAPI application (backend/app/routers/*) talking to
- * PostgreSQL. For the SIH prototype the same contracts, permission matrix, state
+ * PostgreSQL. For the prototype the same contracts, permission matrix, state
  * machine and audit rules run against a local-first store, so every role operates
  * on ONE shared source of truth and the demo works end-to-end in the browser.
  *

@@ -218,7 +218,7 @@ export default function Landing() {
         <div className="mx-auto grid max-w-6xl items-center gap-10 px-4 pb-16 pt-12 sm:px-6 lg:grid-cols-[1.05fr_0.95fr] lg:pt-16">
           <div>
             <p className="anim-fade-up mb-4 inline-flex items-center gap-2 rounded-full border border-brand-200 bg-white px-3 py-1 text-[11px] font-bold uppercase tracking-[0.14em] text-brand-700 shadow-sm">
-              <span className="h-2 w-2 rounded-full bg-emerald-500 pulse-dot" /> Smart India Hackathon 2026 · Prototype
+              <span className="h-2 w-2 rounded-full bg-emerald-500 pulse-dot" />Prototype
             </p>
             <h1 className="anim-fade-up font-display text-[52px] font-extrabold leading-[0.95] tracking-tight text-brand-950 sm:text-[72px]" style={{ animationDelay: "60ms" }}>
               RAK<span className="text-brand-600">SHA</span>
@@ -414,7 +414,7 @@ export default function Landing() {
               <p className="text-[11px] text-slate-500">{t("tagline")}</p>
             </div>
           </div>
-          <p className="text-[11px] text-slate-400">Smart India Hackathon 2026 · Prototype with seeded demo data · Not for clinical use</p>
+          <p className="text-[11px] text-slate-400">Prototype with seeded demo data · Not for clinical use</p>
         </div>
       </footer>
     </div>
