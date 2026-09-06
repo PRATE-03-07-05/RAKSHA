@@ -28,6 +28,31 @@ const ROLE_LABEL: Record<Role, string> = {
 };
 
 interface NavItem { to: string; key: TKey; icon: React.ReactNode; end?: boolean }
+
+/* Shared nav lists are hoisted ABOVE `NAV` on purpose: referencing them from
+ * the `NAV` initializer is safe, whereas a helper that reads `NAV` during its
+ * own initialization hits the temporal dead zone (blank-page ReferenceError). */
+const ASHA_NAV: NavItem[] = [
+  { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
+  { to: "/app/patients", key: "patients", icon: <Users className="h-[18px] w-[18px]" /> },
+  { to: "/app/register", key: "registerPatient", icon: <UserPlus className="h-[18px] w-[18px]" /> },
+  { to: "/app/assess", key: "riskAssessment", icon: <HeartPulse className="h-[18px] w-[18px]" /> },
+  { to: "/app/referrals", key: "referrals", icon: <Signpost className="h-[18px] w-[18px]" /> },
+  { to: "/app/followups", key: "followups", icon: <ClipboardList className="h-[18px] w-[18px]" /> },
+  { to: "/app/sync", key: "syncCenter", icon: <RefreshCw className="h-[18px] w-[18px]" /> },
+  { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
+];
+const DOCTOR_NAV_ITEMS: NavItem[] = [
+  { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
+  { to: "/app/queue", key: "patientQueue", icon: <ListOrdered className="h-[18px] w-[18px]" /> },
+  { to: "/app/patients", key: "patients", icon: <Users className="h-[18px] w-[18px]" /> },
+  { to: "/app/referrals", key: "referrals", icon: <Signpost className="h-[18px] w-[18px]" /> },
+  { to: "/app/tele", key: "teleconsultation", icon: <Video className="h-[18px] w-[18px]" /> },
+  { to: "/app/emergency", key: "emergency", icon: <Siren className="h-[18px] w-[18px]" /> },
+  { to: "/app/followups", key: "followups", icon: <ClipboardList className="h-[18px] w-[18px]" /> },
+  { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
+];
+
 const NAV: Record<Role, NavItem[]> = {
   PATIENT: [
     { to: "/app/home", key: "home", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
@@ -39,17 +64,8 @@ const NAV: Record<Role, NavItem[]> = {
     { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
     { to: "/app/profile", key: "profile", icon: <UserCircle className="h-[18px] w-[18px]" /> },
   ],
-  ASHA: [
-    { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
-    { to: "/app/patients", key: "patients", icon: <Users className="h-[18px] w-[18px]" /> },
-    { to: "/app/register", key: "registerPatient", icon: <UserPlus className="h-[18px] w-[18px]" /> },
-    { to: "/app/assess", key: "riskAssessment", icon: <HeartPulse className="h-[18px] w-[18px]" /> },
-    { to: "/app/referrals", key: "referrals", icon: <Signpost className="h-[18px] w-[18px]" /> },
-    { to: "/app/followups", key: "followups", icon: <ClipboardList className="h-[18px] w-[18px]" /> },
-    { to: "/app/sync", key: "syncCenter", icon: <RefreshCw className="h-[18px] w-[18px]" /> },
-    { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
-  ],
-  ANM: NAV_ANM(),
+  ASHA: ASHA_NAV,
+  ANM: ASHA_NAV,
   PHC_STAFF: [
     { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
     { to: "/app/patients", key: "patients", icon: <Users className="h-[18px] w-[18px]" /> },
@@ -58,9 +74,9 @@ const NAV: Record<Role, NavItem[]> = {
     { to: "/app/sync", key: "syncCenter", icon: <RefreshCw className="h-[18px] w-[18px]" /> },
     { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
   ],
-  PHC_DOCTOR: DOCTOR_NAV(),
-  CHC_DOCTOR: DOCTOR_NAV(),
-  SPECIALIST: DOCTOR_NAV(),
+  PHC_DOCTOR: DOCTOR_NAV_ITEMS,
+  CHC_DOCTOR: DOCTOR_NAV_ITEMS,
+  SPECIALIST: DOCTOR_NAV_ITEMS,
   DISTRICT_ADMIN: [
     { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
     { to: "/app/facilities", key: "facilities", icon: <Building2 className="h-[18px] w-[18px]" /> },
@@ -72,19 +88,6 @@ const NAV: Record<Role, NavItem[]> = {
     { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
   ],
 };
-function NAV_ANM(): NavItem[] { return NAV.ASHA; }
-function DOCTOR_NAV(): NavItem[] {
-  return [
-    { to: "/app/dashboard", key: "dashboard", icon: <LayoutDashboard className="h-[18px] w-[18px]" /> },
-    { to: "/app/queue", key: "patientQueue", icon: <ListOrdered className="h-[18px] w-[18px]" /> },
-    { to: "/app/patients", key: "patients", icon: <Users className="h-[18px] w-[18px]" /> },
-    { to: "/app/referrals", key: "referrals", icon: <Signpost className="h-[18px] w-[18px]" /> },
-    { to: "/app/tele", key: "teleconsultation", icon: <Video className="h-[18px] w-[18px]" /> },
-    { to: "/app/emergency", key: "emergency", icon: <Siren className="h-[18px] w-[18px]" /> },
-    { to: "/app/followups", key: "followups", icon: <ClipboardList className="h-[18px] w-[18px]" /> },
-    { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
-  ];
-}
 
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const { user, logout } = useAuth();
