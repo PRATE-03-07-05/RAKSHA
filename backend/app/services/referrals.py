@@ -33,7 +33,10 @@ ALLOWED_TRANSITIONS: dict[ReferralStatus, list[ReferralStatus]] = {
     ReferralStatus.CANCELLED: [],
 }
 
-# Which roles may perform each incoming transition
+# Which roles may perform each incoming transition (capability gate).
+# Loop closure (COMPLETED) is a participant capability — the outcome flows
+# back to the originator — but the destination-facility scope check below
+# still decides who may actually record it.
 _TRANSITION_ROLES: dict[ReferralStatus, set[Role]] = {
     ReferralStatus.SENT: FIELD | CLINICAL,
     ReferralStatus.ACKNOWLEDGED: {Role.PHC_STAFF} | CLINICAL,
@@ -41,7 +44,7 @@ _TRANSITION_ROLES: dict[ReferralStatus, set[Role]] = {
     ReferralStatus.ARRIVED: FIELD | CLINICAL,
     ReferralStatus.IN_CONSULTATION: CLINICAL,
     ReferralStatus.TREATMENT: CLINICAL,
-    ReferralStatus.COMPLETED: CLINICAL,
+    ReferralStatus.COMPLETED: FIELD | CLINICAL,
     ReferralStatus.CANCELLED: FIELD | CLINICAL | {Role.DISTRICT_ADMIN},
 }
 
@@ -57,10 +60,19 @@ def is_overdue(referral: Referral, today: date | None = None) -> bool:
     return exp < (today or date.today())
 
 
-def _authorize(user: User, referral: Referral, target: ReferralStatus) -> None:
+def _authorize_role(user: User, target: ReferralStatus) -> None:
+    """Capability gate: can this role EVER perform this transition kind?
+
+    Checked before the state machine so an unauthorized actor receives 403
+    even when the referral's current state would also reject the transition
+    (which is a 409 for authorized actors)."""
     if user.role not in _TRANSITION_ROLES.get(target, set()):
         raise HTTPException(status.HTTP_403_FORBIDDEN,
                             f"Role {user.role.value} cannot move a referral to {target.value}")
+
+
+def _authorize_scope(user: User, referral: Referral, target: ReferralStatus) -> None:
+    """Facility/actor scoping: may this specific user act on THIS referral?"""
     at_destination = user.facility_id and user.facility_id == referral.to_facility_id
     at_source = user.facility_id and user.facility_id == referral.from_facility_id
     is_creator = user.id == referral.created_by_id
@@ -100,14 +112,22 @@ def apply_transition(
     outcome: str | None = None,
     outcome_notes: str | None = None,
 ) -> Referral:
-    """Validate + apply one transition, append event, audit, notify."""
+    """Validate + apply one transition, append event, audit, notify.
+
+    Enforcement order (RAKSHA contract):
+      1. role capability        -> 403 (unauthorized actor, any state)
+      2. state-machine validity -> 409 (authorized actor, invalid transition)
+      3. facility/actor scope   -> 403 (right role, wrong facility/referral)
+      4. outcome requirement    -> 422 (closing the loop needs an outcome)
+    """
+    _authorize_role(user, target)
     if target not in ALLOWED_TRANSITIONS.get(referral.status, []):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"Invalid transition {referral.status.value} → {target.value}. "
             f"Allowed: {[s.value for s in next_statuses(referral.status)]}",
         )
-    _authorize(user, referral, target)
+    _authorize_scope(user, referral, target)
 
     if target == ReferralStatus.COMPLETED and not outcome:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
