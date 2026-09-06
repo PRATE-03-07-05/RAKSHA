@@ -28,6 +28,9 @@ def _consultation_out(c: Consultation, db: Session) -> ConsultationOut:
     meds = db.execute(select(Prescription).where(Prescription.consultation_id == c.id)).scalars().all()
     out = ConsultationOut.model_validate(c)
     out.meds = [MedItem(medicine=m.medicine, dose=m.dose, duration=m.duration) for m in meds]
+    doctor = db.get(User, c.doctor_id) if c.doctor_id else None
+    out.doctor_name = doctor.name if doctor else None
+    out.specialty = doctor.specialty if doctor else None
     return out
 
 
@@ -39,17 +42,38 @@ def get_records(patient_id: str, user: CurrentUser, db: DB):
     log_action(db, user, AuditAction.RECORD_VIEW, "records", p.id, patient_id=p.id)
     db.commit()
 
-    visits = [VisitOut.model_validate(v) for v in
-              db.execute(select(Visit).where(Visit.patient_id == p.id).order_by(Visit.created_at.desc())).scalars()]
-    vitals = [VitalOut.model_validate(v) for v in
-              db.execute(select(VitalObservation).where(VitalObservation.patient_id == p.id)
-                         .order_by(VitalObservation.recorded_at.desc())).scalars()]
+    ucache: dict[str, User | None] = {}
+
+    def uget(uid_: str | None) -> User | None:
+        if uid_ and uid_ not in ucache:
+            ucache[uid_] = db.get(User, uid_)
+        return ucache[uid_] if uid_ else None
+
+    visits = []
+    for v in db.execute(select(Visit).where(Visit.patient_id == p.id)
+                        .order_by(Visit.created_at.desc())).scalars():
+        vo = VisitOut.model_validate(v)
+        w = uget(v.worker_id)
+        vo.worker_name = w.name if w else None
+        vo.worker_role = w.role.value if w else None
+        visits.append(vo)
+    vitals = []
+    for v in db.execute(select(VitalObservation).where(VitalObservation.patient_id == p.id)
+                        .order_by(VitalObservation.recorded_at.desc())).scalars():
+        vo2 = VitalOut.model_validate(v)
+        w2 = uget(v.recorded_by_id)
+        vo2.recorded_by_name = w2.name if w2 else None
+        vitals.append(vo2)
     consults = [_consultation_out(c, db) for c in
                 db.execute(select(Consultation).where(Consultation.patient_id == p.id)
                            .order_by(Consultation.created_at.desc())).scalars()]
-    diagnostics = [DiagnosticOut.model_validate(d) for d in
-                   db.execute(select(DiagnosticRecord).where(DiagnosticRecord.patient_id == p.id)
-                              .order_by(DiagnosticRecord.created_at.desc())).scalars()]
+    diagnostics = []
+    for d in db.execute(select(DiagnosticRecord).where(DiagnosticRecord.patient_id == p.id)
+                        .order_by(DiagnosticRecord.created_at.desc())).scalars():
+        do = DiagnosticOut.model_validate(d)
+        w3 = uget(d.ordered_by_id)
+        do.ordered_by_name = w3.name if w3 else None
+        diagnostics.append(do)
     followups = [FollowUpOut.model_validate(f) for f in
                  db.execute(select(FollowUp).where(FollowUp.patient_id == p.id)
                             .order_by(FollowUp.scheduled_date.desc())).scalars()]
@@ -71,7 +95,10 @@ def create_visit(patient_id: str, body: VisitCreate, user: CurrentUser, db: DB):
     log_action(db, user, AuditAction.VISIT_CREATE, "visit", v.id, patient_id=p.id)
     db.commit()
     db.refresh(v)
-    return v
+    out = VisitOut.model_validate(v)
+    out.worker_name = user.name
+    out.worker_role = user.role.value
+    return out
 
 
 @router.post("/patients/{patient_id}/vitals", response_model=VitalOut,
@@ -96,7 +123,9 @@ def create_vitals(patient_id: str, body: VitalCreate, user: CurrentUser, db: DB)
                detail={"spo2": o.spo2, "temp": o.temperature})
     db.commit()
     db.refresh(o)
-    return o
+    vout = VitalOut.model_validate(o)
+    vout.recorded_by_name = user.name
+    return vout
 
 
 @router.post("/patients/{patient_id}/consultations", response_model=ConsultationOut,
@@ -144,7 +173,9 @@ def create_diagnostic(patient_id: str, body: DiagnosticCreate, user: CurrentUser
                detail={"test": body.test})
     db.commit()
     db.refresh(d)
-    return d
+    dout = DiagnosticOut.model_validate(d)
+    dout.ordered_by_name = user.name
+    return dout
 
 
 # ------------------------------------------------------------------ follow-ups

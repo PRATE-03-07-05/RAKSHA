@@ -54,12 +54,22 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SafeUser | null>(null);
   const [booting, setBooting] = useState(true);
   const { toast } = useToast();
+  const userRefLogout = useRef<SafeUser | null>(null);
+  userRefLogout.current = user;
 
   useEffect(() => {
-    const token = localStorage.getItem(SESSION_KEY);
-    const u = api.sessionUser(token);
-    if (u) { const { password: _p, ...safe } = u; void _p; setUser(safe); }
-    setBooting(false);
+    let alive = true;
+    (async () => {
+      // Real session restore: validates the JWT server-side via GET /auth/me.
+      if (localStorage.getItem(SESSION_KEY)) {
+        try {
+          const u = await api.sessionUser();
+          if (alive && u) { const { password: _p, ...safe } = u; void _p; setUser(safe); }
+        } catch { /* invalid/expired token — stay signed out */ }
+      }
+      if (alive) setBooting(false);
+    })();
+    return () => { alive = false; };
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
@@ -71,9 +81,8 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [toast]);
 
   const logout = useCallback(() => {
-    const token = localStorage.getItem(SESSION_KEY);
-    const u = api.sessionUser(token);
-    if (u) api.logout(u);
+    const u = userRefLogout.current;
+    if (u) api.logout(u as User);
     localStorage.removeItem(SESSION_KEY);
     setUser(null);
   }, []);

@@ -44,6 +44,15 @@ def assert_can_view(user: User, patient: Patient) -> None:
                             "Patient consent is not active — access denied and logged")
 
 
+def _pout(db: Session, p: Patient) -> PatientOut:
+    """PatientOut with the assigned health worker's name resolved."""
+    out = PatientOut.model_validate(p)
+    if p.asha_id:
+        asha = db.get(User, p.asha_id)
+        out.asha_name = asha.name if asha else None
+    return out
+
+
 @router.get("", response_model=Page[PatientOut], summary="Search patients (role-scoped)")
 def list_patients(
     user: CurrentUser, db: DB,
@@ -53,9 +62,9 @@ def list_patients(
 ):
     if user.role == Role.PATIENT:
         rows = db.execute(select(Patient).where(Patient.user_id == user.id)).scalars().all()
-        return Page(items=[PatientOut.model_validate(r) for r in rows], total=len(rows), limit=limit, offset=0)
+        return Page(items=[_pout(db, r) for r in rows], total=len(rows), limit=limit, offset=0)
     rows, total = patient_search(db, user, q, limit, offset)
-    return Page(items=[PatientOut.model_validate(r) for r in rows], total=total, limit=limit, offset=offset)
+    return Page(items=[_pout(db, r) for r in rows], total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=PatientOut, status_code=status.HTTP_201_CREATED,
@@ -81,7 +90,7 @@ def create_patient(body: PatientCreate, user: CurrentUser, db: DB):
                detail={"rak_id": p.rak_id, "village": p.village})
     db.commit()
     db.refresh(p)
-    return PatientOut.model_validate(p)
+    return _pout(db, p)
 
 
 @router.get("/{patient_id}", response_model=PatientOut, summary="Patient profile (consent + RBAC enforced)")
@@ -93,7 +102,7 @@ def get_patient(patient_id: str, request: Request, user: CurrentUser, db: DB):
                ip=request.client.host if request.client else None)
     db.commit()
     db.refresh(p)
-    return PatientOut.model_validate(p)
+    return _pout(db, p)
 
 
 @router.patch("/{patient_id}", response_model=PatientOut, summary="Update patient (optimistic versioning)")
@@ -124,7 +133,7 @@ def update_patient(patient_id: str, body: PatientUpdate, user: CurrentUser, db: 
                detail={"fields": sorted(changes.keys()), "version": p.version})
     db.commit()
     db.refresh(p)
-    return PatientOut.model_validate(p)
+    return _pout(db, p)
 
 
 @router.get("/{patient_id}/timeline", response_model=list[TimelineEvent],
