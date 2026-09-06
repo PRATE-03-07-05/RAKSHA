@@ -93,7 +93,9 @@ All endpoints except `/auth/login` and `/health` require
 | POST | `/referrals/{id}/followup` | staff | schedules follow-up, sets `follow_up_date` |
 | GET | `/referrals/meta/flow` | any | state machine for UI rendering |
 
-**State machine** (invalid transitions → 409, unauthorized → 403):
+**State machine** — enforcement order is deliberate:
+role capability → **403** · invalid transition for an authorized role → **409** ·
+right role but wrong facility/referral → **403** · completion without outcome → **422**:
 
 ```
 CREATED → SENT → ACKNOWLEDGED → ACCEPTED → ARRIVED → IN_CONSULTATION → TREATMENT → COMPLETED

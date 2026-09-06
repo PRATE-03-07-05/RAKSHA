@@ -7,6 +7,8 @@ Swagger UI: /docs · ReDoc: /redoc · Health: /health
 import logging
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -49,6 +51,17 @@ app.add_middleware(
 @app.exception_handler(IntegrityError)
 async def integrity_handler(_: Request, exc: IntegrityError):
     return JSONResponse(status_code=409, content={"detail": "Conflict: unique constraint violation"})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    """Standard 422 response — plus server-side field-level detail so
+    contract mismatches are diagnosable from the logs alone."""
+    logging.getLogger("raksha.api").warning(
+        "Request validation failed: %s %s -> %s",
+        request.method, request.url.path, exc.errors(),
+    )
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 @app.get("/health", tags=["system"], summary="Liveness + database probe")

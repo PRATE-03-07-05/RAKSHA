@@ -9,6 +9,8 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
+from .models import Gender
+
 T = TypeVar("T")
 
 
@@ -54,8 +56,12 @@ class PatientCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     date_of_birth: date | None = None
     age: int = Field(ge=0, le=120)
-    gender: str = Field(pattern="^(MALE|FEMALE|OTHER)$")
-    phone: str | None = Field(max_length=20)
+    # Enum-typed: only MALE/FEMALE/OTHER are accepted (422 otherwise) and the
+    # OpenAPI contract matches the database column exactly.
+    gender: Gender
+    # Explicit default=None (mirrors VitalCreate) — a constrained Optional
+    # must never rely on implicit default resolution.
+    phone: str | None = Field(default=None, max_length=20)
     village: str | None = None
     address: str | None = None
     district: str | None = None
