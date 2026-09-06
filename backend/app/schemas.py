@@ -113,6 +113,7 @@ class PatientOut(ORM):
     version: int = 1
     created_at: datetime
     updated_at: datetime
+    asha_name: str | None = None
 
 
 # -------------------------------------------------------------------- records
@@ -138,6 +139,8 @@ class VisitOut(ORM):
     notes: str | None = None
     source: str
     created_at: datetime
+    worker_name: str | None = None
+    worker_role: str | None = None
 
 
 class VitalCreate(BaseModel):
@@ -169,6 +172,7 @@ class VitalOut(ORM):
     source: str
     recorded_at: datetime
     created_at: datetime
+    recorded_by_name: str | None = None
 
 
 class AssessmentOut(ORM):
@@ -186,6 +190,7 @@ class AssessmentOut(ORM):
     confirmed_by_id: str | None = None
     confirmed_at: datetime | None = None
     created_at: datetime
+    confirmed_by_name: str | None = None
 
 
 class MedItem(BaseModel):
@@ -217,6 +222,8 @@ class ConsultationOut(ORM):
     follow_up_date: date | None = None
     created_at: datetime
     meds: list[MedItem] = []
+    doctor_name: str | None = None
+    specialty: str | None = None
 
 
 class DiagnosticCreate(BaseModel):
@@ -236,6 +243,7 @@ class DiagnosticOut(ORM):
     result_text: str | None = None
     created_at: datetime
     completed_at: datetime | None = None
+    ordered_by_name: str | None = None
 
 
 class FollowUpCreate(BaseModel):
@@ -296,6 +304,7 @@ class ReferralEventOut(ORM):
     facility_id: str | None = None
     notes: str | None = None
     created_at: datetime
+    actor_name: str | None = None
 
 
 class ReferralOut(ORM):
@@ -319,6 +328,8 @@ class ReferralOut(ORM):
     completed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    created_by_name: str | None = None
+    created_by_role: str | None = None
 
 
 class ReferralDetail(ReferralOut):
@@ -448,6 +459,8 @@ class TeleOut(ORM):
     recommendation: str | None = None
     follow_up_date: date | None = None
     created_at: datetime
+    doctor_name: str | None = None
+    specialty: str | None = None
 
 
 # ------------------------------------------------------------------ emergency
@@ -477,6 +490,8 @@ class EmergencyOut(ORM):
     ack_at: datetime | None = None
     resolved_at: datetime | None = None
     created_at: datetime
+    doctor_name: str | None = None
+    sms_token: str | None = None
 
 
 class SmsRedeem(BaseModel):

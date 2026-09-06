@@ -29,16 +29,32 @@ DB = Annotated[Session, Depends(get_db)]
 CREATORS = (*FIELD_WORKERS, *CLINICAL)
 
 
-def _out(r: Referral) -> ReferralOut:
+def _events(db: Session, r: Referral) -> list[ReferralEventOut]:
+    outs: list[ReferralEventOut] = []
+    for e in r.events:
+        eo = ReferralEventOut.model_validate(e)
+        actor = db.get(User, e.actor_id) if e.actor_id else None
+        eo.actor_name = actor.name if actor else None
+        outs.append(eo)
+    return outs
+
+
+def _out(db: Session, r: Referral) -> ReferralOut:
     out = ReferralOut.model_validate(r)
     out.overdue = svc.is_overdue(r)
+    creator = db.get(User, r.created_by_id) if r.created_by_id else None
+    out.created_by_name = creator.name if creator else None
+    out.created_by_role = creator.role.value if creator else None
     return out
 
 
-def _detail(r: Referral) -> ReferralDetail:
+def _detail(db: Session, r: Referral) -> ReferralDetail:
     d = ReferralDetail.model_validate(r)
     d.overdue = svc.is_overdue(r)
-    d.events = [ReferralEventOut.model_validate(e) for e in r.events]
+    creator = db.get(User, r.created_by_id) if r.created_by_id else None
+    d.created_by_name = creator.name if creator else None
+    d.created_by_role = creator.role.value if creator else None
+    d.events = _events(db, r)
     return d
 
 
@@ -106,7 +122,7 @@ def create_referral(body: ReferralCreate, user: CurrentUser, db: DB):
                link=f"/app/referrals/{r.id}", actor=user)
     db.commit()
     db.refresh(r)
-    return _out(r)
+    return _out(db, r)
 
 
 @router.get("", response_model=Page[ReferralOut], summary="List referrals (role/facility scoped)")
@@ -142,7 +158,7 @@ def list_referrals(
     rows = list(db.execute(q.order_by(Referral.created_at.desc())).scalars().all())
     total = len(rows)
     page = rows[offset: offset + limit]
-    return Page(items=[_out(r) for r in page], total=total, limit=limit, offset=offset)
+    return Page(items=[_out(db, r) for r in page], total=total, limit=limit, offset=offset)
 
 
 @router.get("/meta/flow", summary="Referral state machine (for UI rendering)")
@@ -163,7 +179,7 @@ def get_referral(referral_id: str, user: CurrentUser, db: DB):
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Referral not found")
     _assert_visible(user, r, db)
-    return _detail(r)
+    return _detail(db, r)
 
 
 @router.get("/{referral_id}/history", response_model=list[ReferralEventOut],
@@ -173,7 +189,7 @@ def referral_history(referral_id: str, user: CurrentUser, db: DB):
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Referral not found")
     _assert_visible(user, r, db)
-    return [ReferralEventOut.model_validate(e) for e in r.events]
+    return _events(db, r)
 
 
 @router.post("/{referral_id}/transition", response_model=ReferralDetail,
@@ -190,7 +206,7 @@ def transition(referral_id: str, body: ReferralTransition, user: CurrentUser, db
                          outcome=body.outcome, outcome_notes=body.outcome_notes)
     db.commit()
     db.refresh(r)
-    return _detail(r)
+    return _detail(db, r)
 
 
 @router.post("/{referral_id}/followup", response_model=FollowUpOut,

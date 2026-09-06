@@ -69,11 +69,14 @@ def analytics(_: CurrentUser, db: DB):
     patients_by_month = [{"month": k, "patients": v} for k, v in sorted(by_month.items())][-6:]
 
     pmap = {p.id: p for p in patients}
-    hr_by_fac: dict[str, int] = {}
+    hr_by_fac: dict[str, dict[str, int]] = {}
     for a in high:
         fac = (pmap.get(a.patient_id).phc_id if pmap.get(a.patient_id) else None) or "UNASSIGNED"
-        hr_by_fac[fac] = hr_by_fac.get(fac, 0) + 1
-    high_risk_by_facility = [{"facility_id": k, "high_risk_cases": v} for k, v in hr_by_fac.items()]
+        bucket = hr_by_fac.setdefault(fac, {"high": 0, "critical": 0})
+        bucket["critical" if a.level.value == "CRITICAL" else "high"] += 1
+    high_risk_by_facility = [{"facility_id": k, "high_risk_cases": v["high"] + v["critical"],
+                              "high": v["high"], "critical": v["critical"]}
+                             for k, v in hr_by_fac.items()]
 
     shortages = 0
     for f in facilities:

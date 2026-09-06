@@ -1,75 +1,88 @@
 /**
- * RAKSHA service layer.
+ * RAKSHA service layer — real FastAPI client.
  *
- * In production this is the FastAPI application (backend/app/routers/*) talking to
- * PostgreSQL. For the SIH prototype the same contracts, permission matrix, state
- * machine and audit rules run against a local-first store, so every role operates
- * on ONE shared source of truth and the demo works end-to-end in the browser.
+ * Architecture:
+ *   React pages → api.* (this module) → FastAPI (VITE_API_BASE_URL) → PostgreSQL
  *
- * Every write is append-only for medical observations. When the connectivity
- * probe reports offline, operations are queued (PENDING) and drained by Sync Now.
+ * Rules of the house:
+ *  - ONLINE: every read/write goes to the backend; responses are mirrored into
+ *    an in-memory replica so `getDB()` consumers (dashboards, name lookups,
+ *    AI summary, FHIR export) keep working unchanged.
+ *  - OFFLINE: only operations the backend sync ledger understands
+ *    (patient/visit/vital/referral/followup/assessment creates) are applied to
+ *    the replica AND queued in IndexedDB as PENDING. Everything else fails
+ *    loudly — we never pretend a write reached PostgreSQL while offline.
+ *  - Sync: `POST /sync/batch` with client operation ids (idempotent); results
+ *    are mapped to SYNCED / FAILED and persisted back to IndexedDB.
+ *  - AI triage, FHIR bundle and record summary stay deterministic local
+ *    utilities (decision support only — never a diagnosis).
  */
-import { buildSeed } from "../data/seed";
-import { assessRisk, RULE_VERSION, type TriageInput } from "../lib/triage";
-import { uid, makeToken, todayISO, daysUntil } from "../lib/utils";
+import { rq, ApiError, getToken, setToken, TOKEN_KEY } from "../lib/http";
+import { syncOpsAll, syncOpsPut, syncOpsRemove } from "../lib/idb";
+import { assessRisk } from "../lib/triage";
+import { uid, todayISO, daysUntil } from "../lib/utils";
 import type {
-  DB, Role, User, Patient, Referral, RefStatus, FollowUp, TimelineEvent, SyncOp, Priority,
+  DB, Role, User, Patient, Referral, RefStatus, ReferralEvent, FollowUp, TimelineEvent,
+  SyncOp, Priority, Visit, Vitals, Assessment, Consultation, Prescription, DiagnosticRecord,
+  Appointment, Teleconsultation, EmergencyEvent, AppNotification, Facility, AuditLog,
+  Availability, TriageFactor,
 } from "../lib/types";
+import type { TriageInput } from "../lib/triage";
 
-const DB_KEY = "raksha.db.v1";
-const SESSION_KEY = "raksha.session.v1";
+export { ApiError };
+export const SESSION_KEY = TOKEN_KEY;
 
-export class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) { super(message); this.status = status; }
+/* ------------------------------------------------------------------ replica */
+
+function emptyDB(): DB {
+  return {
+    version: 0, seededAt: Date.now(),
+    users: [], patients: [], visits: [], vitals: [], assessments: [], consultations: [],
+    prescriptions: [], diagnostics: [], referrals: [], followups: [], appointments: [],
+    teles: [], emergencies: [], notifications: [], facilities: [], audit: [],
+    sync: [], syncBaseline: { synced: 0 }, lastSyncAt: null,
+  };
 }
 
-/* ------------------------------------------------------------------ store */
-
-let cache: DB | null = null;
+let cache: DB = emptyDB();
 const listeners = new Set<() => void>();
 
 export function subscribe(fn: () => void): () => void {
   listeners.add(fn);
-  const onStorage = (e: StorageEvent) => { if (e.key === DB_KEY) { cache = null; fn(); } };
-  window.addEventListener("storage", onStorage);
-  return () => { listeners.delete(fn); window.removeEventListener("storage", onStorage); };
+  return () => { listeners.delete(fn); };
 }
-
 function emit() { listeners.forEach(fn => fn()); }
 
-export function getDB(): DB {
-  if (cache) return cache;
-  try {
-    const raw = localStorage.getItem(DB_KEY);
-    if (raw) { cache = JSON.parse(raw) as DB; return cache; }
-  } catch { /* reseed below */ }
-  cache = buildSeed();
-  localStorage.setItem(DB_KEY, JSON.stringify(cache));
-  return cache;
+/** Get the local replica. FastAPI/PostgreSQL is authoritative; this cache is
+ *  a convenience mirror so existing screens keep rendering between fetches. */
+export function getDB(): DB { return cache; }
+
+/** Emit after a real mutation so useApi-backed screens refresh. */
+function save() { cache.version += 1; emit(); }
+
+function upsert<T extends { id: string }>(arr: T[], item: T): void {
+  const i = arr.findIndex(x => x.id === item.id);
+  if (i >= 0) arr[i] = item; else arr.unshift(item);
+}
+function mergeMany<T extends { id: string }>(arr: T[], items: T[]): void {
+  items.forEach(it => upsert(arr, it));
 }
 
-function save() {
-  if (!cache) return;
-  localStorage.setItem(DB_KEY, JSON.stringify(cache));
-  emit();
-}
-
+/** Clear the local replica (server data untouched). */
 export function resetDB(): void {
-  cache = buildSeed();
-  localStorage.setItem(DB_KEY, JSON.stringify(cache));
-  emit();
+  cache = emptyDB();
+  save();
 }
 
 export function facilityName(id?: string): string {
   if (!id) return "—";
-  return getDB().facilities.find(f => f.id === id)?.name ?? id;
+  return cache.facilities.find(f => f.id === id)?.name ?? id;
 }
 export function patientName(id: string): string {
-  return getDB().patients.find(p => p.id === id)?.name ?? id;
+  return cache.patients.find(p => p.id === id)?.name ?? id;
 }
 
-/* ------------------------------------------------------- connectivity bridge */
+/* ---------------------------------------------------------- connectivity */
 
 let offlineProbe: () => boolean = () => false;
 export function setOfflineProbe(fn: () => boolean) { offlineProbe = fn; }
@@ -77,29 +90,266 @@ export function setOfflineProbe(fn: () => boolean) { offlineProbe = fn; }
 let syncBridge: { persist?: (op: SyncOp) => void; drain?: (ids: string[]) => void } = {};
 export function registerSyncBridge(b: typeof syncBridge) { syncBridge = b; }
 
-function queueOp(entity: string, label: string): SyncOp {
-  const db = getDB();
-  const offline = offlineProbe();
-  const op: SyncOp = {
-    id: uid("op"), ts: Date.now(), entity, label,
-    status: offline ? "PENDING" : "SYNCED", attempts: 1,
-    ...(offline ? {} : {}),
-  };
-  db.sync.unshift(op);
-  if (op.status === "SYNCED") db.lastSyncAt = op.ts;
-  else op.error = undefined;
+const OFFLINE_MSG = "This action needs a live connection to the RAKSHA server — retry when online.";
+function requireOnline(): void {
+  if (offlineProbe()) throw new ApiError(503, OFFLINE_MSG);
+}
+
+/** Queue an offline-safe create: replica + IndexedDB (PENDING). */
+function queue(entity: string, operation: "create" | "update", payload: Record<string, unknown>, label: string): SyncOp {
+  const op: SyncOp = { id: uid("op"), ts: Date.now(), entity, label, status: "PENDING", attempts: 0, operation, payload };
+  cache.sync.unshift(op);
   syncBridge.persist?.(op);
+  save();
   return op;
 }
-
-function audit(actorId: string, actorName: string, role: Role | "SYSTEM", action: string, resource: string, extra?: { patientId?: string; purpose?: string; details?: string }) {
-  const db = getDB();
-  db.audit.unshift({ id: uid("al"), ts: Date.now(), actorId, actorName, role, action, resource, ...extra });
-  if (db.audit.length > 400) db.audit.length = 400;
+/** Record an online write in the sync history view (already persisted server-side). */
+function recordSynced(entity: string, label: string): void {
+  const op: SyncOp = { id: uid("op"), ts: Date.now(), entity, label, status: "SYNCED", attempts: 1 };
+  cache.sync.unshift(op);
+  cache.lastSyncAt = op.ts;
 }
 
-function notify(n: { targetRole: Role | "ALL"; targetFacilityId?: string; targetUserId?: string; title: string; body: string; kind: "info" | "warning" | "critical" | "success"; link?: string }) {
-  getDB().notifications.unshift({ id: uid("n"), ts: Date.now(), read: false, ...n });
+/* ----------------------------------------------------------------- mappers */
+
+const ep = (iso: string | null | undefined): number => (iso ? Date.parse(iso) : Date.now());
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObj = Record<string, any>;
+
+function mapUser(u: AnyObj): User {
+  return {
+    id: u.id, email: u.email, password: "", name: u.name, role: u.role as Role,
+    facilityId: u.facility_id ?? undefined, village: u.village ?? undefined,
+    phone: u.phone ?? "", specialty: u.specialty ?? undefined,
+  };
+}
+
+function mapPatient(p: AnyObj): Patient {
+  return {
+    id: p.id, rakId: p.rak_id, name: p.name, dob: p.date_of_birth ?? "", age: p.age,
+    gender: p.gender, phone: p.phone ?? "", village: p.village ?? "", address: p.address ?? "",
+    emergencyContact: p.emergency_contact ?? "", emergencyPhone: p.emergency_phone ?? "",
+    conditions: p.conditions ?? [], allergies: p.allergies ?? [], pregnant: p.pregnant ?? false,
+    bloodGroup: p.blood_group ?? undefined, ashaId: p.asha_id ?? "", ashaName: p.asha_name ?? "",
+    phcId: p.phc_id ?? "", consent: p.consent_granted ? "ACTIVE" : "LIMITED", createdAt: ep(p.created_at),
+  };
+}
+
+function visitType(facilityId?: string): Visit["type"] {
+  const f = cache.facilities.find(x => x.id === facilityId);
+  if (f?.type === "SUBCENTRE") return "SUBCENTRE";
+  if (f?.type === "PHC") return "PHC_VISIT";
+  return "HOME_VISIT";
+}
+
+function mapVisit(v: AnyObj): Visit {
+  return {
+    id: v.id, patientId: v.patient_id, workerId: v.worker_id, workerName: v.worker_name ?? "",
+    role: (v.worker_role as Role) ?? "ASHA", facilityId: v.facility_id ?? undefined,
+    location: v.location ?? "", ts: ep(v.created_at), type: visitType(v.facility_id),
+    symptoms: v.symptoms ?? [], complaint: v.complaint ?? "", observations: v.observations ?? "",
+    notes: v.notes ?? "",
+  };
+}
+
+function mapVitals(v: AnyObj): Vitals {
+  return {
+    id: v.id, patientId: v.patient_id, workerId: v.recorded_by_id, workerName: v.recorded_by_name ?? "",
+    facilityId: v.facility_id ?? undefined, ts: ep(v.recorded_at),
+    sys: v.systolic ?? undefined, dia: v.diastolic ?? undefined, temp: v.temperature ?? undefined,
+    spo2: v.spo2 ?? undefined, hr: v.heart_rate ?? undefined, rr: v.respiratory_rate ?? undefined,
+    weight: v.weight_kg ?? undefined, device: v.device ?? undefined,
+  };
+}
+
+function mapFactor(f: AnyObj): TriageFactor {
+  const w = Number(f.weight ?? 0);
+  return {
+    label: f.label ?? f.code ?? "Factor",
+    detail: f.code ?? "FACTOR",
+    severity: w >= 50 ? "critical" : w >= 25 ? "high" : w >= 15 ? "warn" : "info",
+  };
+}
+
+function mapAssessment(a: AnyObj): Assessment {
+  const snap = a.input_snapshot ?? {};
+  return {
+    id: a.id, patientId: a.patient_id, workerId: a.confirmed_by_id ?? "",
+    workerName: a.confirmed_by_name ?? "RAKSHA triage", role: "ASHA",
+    ts: ep(a.created_at),
+    inputs: {
+      symptoms: snap.symptoms ?? [], sys: undefined, dia: undefined, temp: snap.temperature ?? undefined,
+      spo2: snap.spo2 ?? undefined, hr: snap.heart_rate ?? undefined, age: snap.age ?? 0,
+      pregnant: snap.pregnant ?? false, conditions: snap.conditions ?? [],
+      severity: snap.severity_reported ?? "MODERATE",
+    },
+    level: a.level, factors: (a.factors ?? []).map(mapFactor),
+    recommendation: a.recommendation, version: a.rule_version,
+    confirmed: !!a.confirmed, confirmedBy: a.confirmed_by_name ?? undefined,
+    confirmedAt: a.confirmed_at ? ep(a.confirmed_at) : undefined,
+  };
+}
+
+function mapConsultation(c: AnyObj): Consultation {
+  return {
+    id: c.id, patientId: c.patient_id, doctorId: c.doctor_id, doctorName: c.doctor_name ?? "",
+    specialty: c.specialty ?? undefined, facilityId: c.facility_id ?? "", ts: ep(c.created_at),
+    complaint: c.complaint, findings: c.findings ?? "", assessment: c.assessment,
+    plan: c.plan ?? "", followUpDate: c.follow_up_date ?? undefined,
+    isTele: typeof c.complaint === "string" && c.complaint.startsWith("Teleconsultation"),
+  };
+}
+
+function prescriptionFrom(c: AnyObj): Prescription | null {
+  const meds = (c.meds ?? []) as AnyObj[];
+  if (!meds.length) return null;
+  return {
+    id: `${c.id}-rx`, patientId: c.patient_id, doctorId: c.doctor_id, doctorName: c.doctor_name ?? "",
+    facilityId: c.facility_id ?? "", ts: ep(c.created_at),
+    meds: meds.map(m => ({ name: m.medicine, dose: m.dose ?? "", duration: m.duration ?? "" })),
+  };
+}
+
+function mapDiagnostic(d: AnyObj): DiagnosticRecord {
+  return {
+    id: d.id, patientId: d.patient_id, orderedById: d.ordered_by_id, orderedByName: d.ordered_by_name ?? "",
+    facilityId: d.facility_id ?? "", ts: ep(d.created_at), test: d.test,
+    result: d.result_text ?? undefined, status: d.status === "COMPLETED" ? "COMPLETED" : "ORDERED",
+  };
+}
+
+function mapReferralEvent(e: AnyObj): ReferralEvent {
+  return {
+    id: e.id, ts: ep(e.created_at), actorId: e.actor_id, actorName: e.actor_name ?? "",
+    role: e.actor_role as Role, from: (e.from_status as RefStatus | null) ?? null,
+    to: e.to_status as RefStatus, facilityId: e.facility_id ?? "", notes: e.notes ?? undefined,
+  };
+}
+
+function mapReferral(r: AnyObj, events?: AnyObj[]): Referral {
+  return {
+    id: r.id, code: r.code, patientId: r.patient_id,
+    fromFacilityId: r.from_facility_id, toFacilityId: r.to_facility_id,
+    createdBy: r.created_by_id, createdByName: r.created_by_name ?? "",
+    creatorRole: (r.created_by_role as Role) ?? "PHC_DOCTOR", ts: ep(r.created_at),
+    reason: r.reason, priority: r.priority as Priority, clinicalSummary: r.clinical_summary ?? "",
+    vitalsSnapshot: r.vitals_snapshot ?? undefined, expectedDate: r.expected_date ?? todayISO(),
+    status: r.status as RefStatus, completedAt: r.completed_at ? ep(r.completed_at) : undefined,
+    followUpDate: r.follow_up_date ?? undefined,
+    events: (events ?? []).map(mapReferralEvent),
+  };
+}
+
+function mapFollowUp(f: AnyObj): FollowUp {
+  return {
+    id: f.id, patientId: f.patient_id, referralId: f.referral_id ?? undefined,
+    date: f.scheduled_date, assigneeRole: f.assignee_role as Role, assigneeId: undefined,
+    notes: f.notes ?? "", status: f.status === "COMPLETED" ? "COMPLETED" : "SCHEDULED",
+    completedAt: f.completed_at ? ep(f.completed_at) : undefined, completedBy: undefined,
+  };
+}
+
+function mapAppointment(a: AnyObj): Appointment {
+  return {
+    id: a.id, patientId: a.patient_id, facilityId: a.facility_id, date: a.date, time: a.time,
+    purpose: a.purpose, status: a.status === "SCHEDULED" ? "CONFIRMED" : a.status,
+    queuePos: a.queue_pos ?? undefined,
+  };
+}
+
+function mapTele(t: AnyObj): Teleconsultation {
+  return {
+    id: t.id, patientId: t.patient_id, doctorId: t.doctor_id, doctorName: t.doctor_name ?? "",
+    specialty: t.specialty ?? undefined, facilityId: t.facility_id ?? "",
+    scheduledAt: ep(t.scheduled_at), status: t.status === "CANCELLED" ? "COMPLETED" : t.status,
+    roomCode: t.room_code, completedAt: t.status === "COMPLETED" ? ep(t.created_at) : undefined,
+    summary: t.assessment ?? undefined, recommendation: t.recommendation ?? undefined,
+    followUp: t.follow_up_date ?? undefined,
+  };
+}
+
+function buildSmsLog(e: AnyObj): string[] {
+  const log = [`EMERGENCY|${e.code}|${e.sms_token ?? "••••••"}`,
+    `${e.sms_expires_at ? "one-time token generated (10 min expiry)" : ""}`].filter(Boolean);
+  if (e.sms_redeemed) log.push(`ACCEPTED by ${e.ack_by ?? "receiver"} — alarm triggered (replay now blocked)`);
+  return log;
+}
+
+function mapEmergency(e: AnyObj): EmergencyEvent {
+  return {
+    id: e.id, code: e.code, patientId: e.patient_id, doctorId: e.doctor_id,
+    doctorName: e.doctor_name ?? "", facilityId: e.facility_id ?? "", ts: ep(e.created_at),
+    severity: "CRITICAL", clinicalNote: e.clinical_note, status: e.status,
+    smsToken: e.sms_token ?? "", smsExpiresAt: ep(e.sms_expires_at), smsRedeemed: !!e.sms_redeemed,
+    smsLog: buildSmsLog(e), ackBy: e.ack_by ?? undefined, ackAt: e.ack_at ? ep(e.ack_at) : undefined,
+  };
+}
+
+function mapNotification(n: AnyObj): AppNotification {
+  return {
+    id: n.id, ts: ep(n.created_at), targetRole: "ALL", targetUserId: n.user_id ?? undefined,
+    title: n.title, body: n.body, kind: n.kind, read: !!n.read, link: n.link ?? undefined,
+  };
+}
+
+const FAC_TYPE: Record<string, Facility["type"]> = {
+  SUB_CENTER: "SUBCENTRE", PHC: "PHC", CHC: "CHC", RURAL_HOSPITAL: "CHC",
+  DISTRICT_HOSPITAL: "DH", SPECIALIST_CENTER: "DH",
+};
+
+function facilityDistanceKm(lat?: number, lng?: number): number {
+  const me = cache.facilities.find(f => f.id === sessionUserFacilityId()) ?? cache.facilities[0];
+  if (!lat || !lng || !me) return 0;
+  const R = 6371, dLat = ((me.mapLat ?? lat) - lat) * Math.PI / 180;
+  const dLng = ((me.mapLng ?? lng) - lng) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat * Math.PI / 180) * Math.cos((me.mapLat ?? lat) * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+/* mapLat/mapLng are optional coordinates carried alongside the UI projection. */
+let _sessionFacilityId: string | undefined;
+function sessionUserFacilityId() { return _sessionFacilityId; }
+
+function mapFacility(f: AnyObj, res: AnyObj | null): Facility {
+  const lat: number | undefined = f.latitude ?? undefined;
+  const lng: number | undefined = f.longitude ?? undefined;
+  const avail = (v: string | undefined): Availability =>
+    v === "AVAILABLE" || v === "LIMITED" || v === "UNAVAILABLE" ? v as Availability : "UNAVAILABLE";
+  return {
+    id: f.id, name: f.name, type: FAC_TYPE[f.facility_type] ?? "PHC",
+    village: f.village ?? "", distanceKm: facilityDistanceKm(lat, lng), phone: f.phone ?? "",
+    totalBeds: res?.total_beds ?? 0, availableBeds: res?.available_beds ?? 0,
+    icuBeds: res?.icu_beds ?? 0, icuAvailable: res?.icu_beds ?? 0,
+    emergency: !!res?.emergency_available,
+    oxygen: res?.oxygen_available ? "AVAILABLE" : "UNAVAILABLE",
+    criticalCare: (res?.icu_beds ?? 0) > 0 ? "AVAILABLE" : "UNAVAILABLE",
+    diagnostics: [
+      { name: "CBC", status: avail(res?.cbc) },
+      { name: "X-Ray", status: avail(res?.xray) },
+      { name: "Ultrasound", status: avail(res?.ultrasound) },
+    ],
+    medicines: ((res?.medicines ?? []) as AnyObj[]).map(m => ({ name: m.name, status: avail(m.status) })),
+    specialists: ((res?.specialists ?? []) as AnyObj[]).map(s => ({
+      specialty: s.specialty, name: s.days || "—", available: !!s.available,
+    })),
+    workload: res?.workload_level ?? "MODERATE",
+    mapX: lng != null ? Math.min(100, Math.max(0, ((lng - 73.8) / 1.2) * 100)) : 50,
+    mapY: lat != null ? Math.min(100, Math.max(0, 100 - ((lat - 18.2) / 0.4) * 100)) : 50,
+    ...(lat != null ? { mapLat: lat } : {}),
+    ...(lng != null ? { mapLng: lng } : {}),
+  } as Facility & { mapLat?: number; mapLng?: number } as Facility;
+}
+
+function mapAudit(a: AnyObj): AuditLog {
+  const detail = a.detail ?? {};
+  const bits = Object.entries(detail)
+    .filter(([k]) => k !== "purpose")
+    .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`);
+  return {
+    id: a.id, ts: ep(a.created_at), actorId: a.actor_id ?? "system", actorName: a.actor_name,
+    role: a.actor_role as Role | "SYSTEM", action: a.action, resource: a.resource_kind,
+    patientId: a.patient_id ?? undefined, purpose: detail.purpose, details: bits.join(" · ") || undefined,
+  };
 }
 
 /* -------------------------------------------------------------------- RBAC */
@@ -155,650 +405,725 @@ export function followUpState(f: FollowUp): "COMPLETED" | "DUE_TODAY" | "OVERDUE
   return "UPCOMING";
 }
 
-/* -------------------------------------------------------------------- API */
+/* ---------------------------------------------------------------- warm-up */
 
-const wait = (ms = 300) => new Promise<void>(r => setTimeout(r, ms + Math.random() * 150));
+/** Populate the replica after sign-in (facilities + role-scoped patients +
+ *  latest assessments + sync baseline). Failures are non-fatal: the offline
+ *  banner and empty states handle a downed server. */
+async function warmCacheFor(user: User): Promise<void> {
+  try {
+    const facs = await rq<AnyObj[]>("GET", "/facilities");
+    cache.facilities = await Promise.all(facs.map(async f => {
+      let res: AnyObj | null = null;
+      try { res = await rq<AnyObj>("GET", `/facilities/${f.id}/resources`); } catch { res = null; }
+      return mapFacility(f, res);
+    }));
+    const page = await rq<AnyObj>("GET", user.role === "PATIENT" ? "/patients?limit=10" : "/patients?q=&limit=200");
+    mergeMany(cache.patients, (page.items ?? []).map(mapPatient));
+    if (user.role !== "PATIENT") {
+      const asess = await rq<AnyObj[]>("GET", "/triage/assessments/latest").catch(() => [] as AnyObj[]);
+      mergeMany(cache.assessments, asess.map(mapAssessment));
+    }
+    const sync = await rq<AnyObj>("GET", "/sync/status").catch(() => null);
+    if (sync) {
+      cache.syncBaseline.synced = sync.applied ?? 0;
+      cache.lastSyncAt = sync.last_sync_at ? ep(sync.last_sync_at) : cache.lastSyncAt;
+    }
+    save();
+  } catch {
+    /* offline or server down — replica stays as-is */
+  }
+}
+
+/* ------------------------------------------- shared internals (no `this`) */
+
+async function fetchPatientAccess(u: User, id: string, purpose: string) {
+  const p = mapPatient(await rq<AnyObj>("GET", `/patients/${id}`, { headers: { "X-Access-Purpose": purpose } }));
+  upsert(cache.patients, p);
+  const restricted = p.consent === "LIMITED";
+  return {
+    patient: p, restricted, consent: p.consent,
+    accessedBy: { name: u.name, role: u.role, purpose, at: Date.now() },
+  };
+}
+
+async function listReferralsFor(u: User, opts?: { patientId?: string }): Promise<Referral[]> {
+  if (offlineProbe()) {
+    let list = cache.referrals;
+    if (opts?.patientId) list = list.filter(r => r.patientId === opts.patientId);
+    return [...list].sort((a, b) => b.ts - a.ts);
+  }
+  const page = await rq<{ items?: AnyObj[] }>("GET", "/referrals?limit=200");
+  const list: Referral[] = (page.items ?? []).map((r: AnyObj) => mapReferral(r));
+  mergeMany(cache.referrals, list);
+  const filtered = opts?.patientId ? list.filter((r: Referral) => r.patientId === opts.patientId) : list;
+  void u;
+  return [...filtered].sort((a: Referral, b: Referral) => b.ts - a.ts);
+}
+
+async function loadFacilities(): Promise<Facility[]> {
+  const facs = await rq<AnyObj[]>("GET", "/facilities");
+  const mapped = await Promise.all(facs.map(async f => {
+    let res: AnyObj | null = null;
+    try { res = await rq<AnyObj>("GET", `/facilities/${f.id}/resources`); } catch { res = null; }
+    return mapFacility(f, res);
+  }));
+  cache.facilities = mapped;
+  save();
+  return mapped;
+}
+
+async function buildSyncState() {
+  const idbOps = await syncOpsAll().catch(() => [] as SyncOp[]);
+  // Merge queued ops the replica doesn't know about (e.g. fresh page load).
+  idbOps.forEach(o => { if (o.status !== "SYNCED" && !cache.sync.some(x => x.id === o.id)) cache.sync.unshift(o); });
+  return {
+    ops: [...cache.sync].sort((a, b) => b.ts - a.ts),
+    pending: cache.sync.filter(o => o.status === "PENDING").length,
+    failed: cache.sync.filter(o => o.status === "FAILED").length,
+    synced: cache.syncBaseline.synced + cache.sync.filter(o => o.status === "SYNCED").length,
+    lastSyncAt: cache.lastSyncAt,
+  };
+}
+
+/* -------------------------------------------------------------------- API */
 
 export const api = {
   /* ---- health (GET /health) */
   async health() {
-    return { status: "ok", service: "raksha-api (prototype service layer)", version: "1.0.0", time: new Date().toISOString(), storage: "local-first replica · PostgreSQL in production", triageEngine: RULE_VERSION };
+    return rq<{ status: string; database: string; version: string }>("GET", "/health");
   },
 
-  /* ---- auth (POST /auth/login) */
+  /* ---- auth */
   async login(email: string, password: string) {
-    await wait(420);
-    const db = getDB();
-    const user = db.users.find(u => u.email.toLowerCase() === email.trim().toLowerCase());
-    if (!user || user.password !== password) throw new ApiError(401, "Invalid email or password.");
-    const token = makeToken(user.id, user.role);
-    audit(user.id, user.name, user.role, "LOGIN", "auth", { details: "JWT issued (demo signing)" });
-    save();
-    const { password: _pw, ...safe } = user;
-    void _pw;
-    return { token, user: safe };
+    const res = await rq<{ access_token: string; token_type: string; user: AnyObj }>(
+      "POST", "/auth/login", { body: { email: email.trim().toLowerCase(), password } });
+    setToken(res.access_token);
+    const user = mapUser(res.user);
+    _sessionFacilityId = user.facilityId;
+    void warmCacheFor(user);
+    return { token: res.access_token, user };
   },
 
-  sessionUser(token: string | null): User | null {
-    if (!token) return null;
+  /** Restore the session via GET /auth/me (real JWT validation server-side). */
+  async sessionUser(): Promise<User | null> {
+    if (!getToken()) return null;
     try {
-      const payload = JSON.parse(atob(token.split(".")[1]!)) as { sub: string; exp: number };
-      if (payload.exp < Date.now()) return null;
-      return getDB().users.find(u => u.id === payload.sub) ?? null;
-    } catch { return null; }
+      const me = await rq<AnyObj>("GET", "/auth/me");
+      const user = mapUser(me);
+      _sessionFacilityId = user.facilityId;
+      void warmCacheFor(user);
+      return user;
+    } catch {
+      setToken(null);
+      return null;
+    }
   },
 
   logout(user: User) {
-    audit(user.id, user.name, user.role, "LOGOUT", "auth");
-    save();
+    void user;
+    setToken(null);
+    _sessionFacilityId = undefined;
   },
 
   /* ---- patients */
   async searchPatients(user: User | null, q: string) {
-    await wait();
     const u = requireUser(user);
-    requirePerm(u, u.role === "PATIENT" ? "self.read" : "patient.search");
-    const db = getDB();
-    const term = q.trim().toLowerCase();
-    let list = db.patients;
-    if (u.role === "PATIENT") list = list.filter(p => p.id === `p-${u.id.replace("u-", "")}` || p.name.toLowerCase() === u.name.toLowerCase());
-    else if (u.role === "ASHA" || u.role === "ANM") list = list.filter(p => p.ashaId === u.id || p.phcId === u.facilityId || p.village === u.village);
-    if (term) {
-      list = list.filter(p =>
-        p.name.toLowerCase().includes(term) ||
-        p.rakId.toLowerCase().includes(term) ||
-        p.phone.replace(/\D/g, "").includes(term.replace(/\D/g, "") || "§") ||
-        p.village.toLowerCase().includes(term));
+    if (offlineProbe()) {
+      const term = q.trim().toLowerCase();
+      return cache.patients.filter(p => !term ||
+        p.name.toLowerCase().includes(term) || p.rakId.toLowerCase().includes(term) ||
+        p.phone.replace(/\D/g, "").includes(term.replace(/\D/g, "") || "§") || p.village.toLowerCase().includes(term));
     }
-    return [...list].sort((a, b) => b.createdAt - a.createdAt);
+    const page = await rq<{ items?: AnyObj[] }>("GET", `/patients?q=${encodeURIComponent(q)}&limit=100`);
+    const list: Patient[] = (page.items ?? []).map(mapPatient);
+    mergeMany(cache.patients, list);
+    void u;
+    return list;
   },
 
   async getPatient(user: User | null, id: string, purpose = "Care delivery") {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    const p = db.patients.find(x => x.id === id);
-    if (!p) throw new ApiError(404, "Patient not found.");
-    const self = u.role === "PATIENT" && (p.id === `p-${u.id.replace("u-", "")}` || p.name === u.name);
-    if (u.role === "PATIENT" && !self) throw new ApiError(403, "Patients can only access their own record.");
-    const restricted = p.consent === "LIMITED" && !self && u.role !== "DISTRICT_ADMIN";
-    // Throttle identical access audits (one per actor+patient per minute) so
-    // reactive UI refetches never cascade into audit-write loops.
-    const recent = db.audit.find(a => a.actorId === u.id && a.action === "VIEW_RECORD" && a.patientId === p.id && Date.now() - a.ts < 60000);
-    if (!recent) {
-      audit(u.id, u.name, u.role, "VIEW_RECORD", "patient", { patientId: p.id, purpose, details: restricted ? "Limited consent — restricted view served" : undefined });
-      save();
-    }
-    return { patient: p, restricted, consent: p.consent, accessedBy: { name: u.name, role: u.role, purpose, at: Date.now() } };
+    return fetchPatientAccess(requireUser(user), id, purpose);
   },
 
   async registerPatient(user: User | null, data: Omit<Patient, "id" | "rakId" | "createdAt" | "ashaId" | "ashaName" | "phcId" | "consent">) {
-    await wait(450);
     const u = requireUser(user);
-    requirePerm(u, "patient.create");
-    const db = getDB();
-    const serial = String(300 + db.patients.length).padStart(5, "0");
-    const p: Patient = {
-      ...data, id: uid("p"), rakId: `RAK-PAT-2026-${serial}`,
-      ashaId: u.id, ashaName: u.name, phcId: u.facilityId ?? "F-PHC-01", consent: "ACTIVE",
-      createdAt: Date.now(),
+    const payload: AnyObj = {
+      name: data.name, date_of_birth: data.dob || null, age: data.age, gender: data.gender,
+      phone: data.phone || null, village: data.village || null, address: data.address || null,
+      emergency_contact: data.emergencyContact || null, emergency_phone: data.emergencyPhone || null,
+      blood_group: data.bloodGroup || null, conditions: data.conditions, allergies: data.allergies,
+      pregnant: !!data.pregnant, consent_granted: true,
     };
-    db.patients.unshift(p);
-    queueOp("patient", `Register patient — ${p.name}`);
-    audit(u.id, u.name, u.role, "CREATE_PATIENT", "patient", { patientId: p.id, details: p.rakId });
-    notify({ targetRole: "PHC_STAFF", targetFacilityId: p.phcId, title: "New patient registered", body: `${p.name} (${p.rakId}) registered by ${u.name}, ${p.village}.`, kind: "info", link: `/app/patients/${p.id}` });
+    if (offlineProbe()) {
+      const localId = uid("p");
+      const p: Patient = {
+        ...data, id: localId, rakId: "RAK-PAT-2026-·····", ashaId: u.id, ashaName: u.name,
+        phcId: u.facilityId ?? "", consent: "ACTIVE", createdAt: Date.now(),
+      };
+      upsert(cache.patients, p);
+      queue("patient", "create", { ...payload, id: localId }, `Register patient — ${p.name}`);
+      return p;
+    }
+    const p = mapPatient(await rq<AnyObj>("POST", "/patients", { body: payload }));
+    upsert(cache.patients, p);
+    recordSynced("patient", `Register patient — ${p.name}`);
     save();
     return p;
   },
 
-  async createVisit(user: User | null, data: { patientId: string; type: "HOME_VISIT" | "SUBCENTRE" | "PHC_VISIT"; symptoms: string[]; complaint: string; observations: string; notes: string; location: string }) {
-    await wait();
+  /* ---- records */
+  async createVisit(user: User | null, data: { patientId: string; type: Visit["type"]; symptoms: string[]; complaint: string; observations: string; notes: string; location: string }) {
     const u = requireUser(user);
-    requirePerm(u, "visit.create");
-    const db = getDB();
-    const v = { id: uid("v"), workerId: u.id, workerName: u.name, role: u.role, facilityId: u.facilityId, ts: Date.now(), ...data };
-    db.visits.unshift(v);
-    queueOp("visit", `Visit — ${patientName(data.patientId)}`);
-    audit(u.id, u.name, u.role, "CREATE_VISIT", "visit", { patientId: data.patientId });
+    if (offlineProbe()) {
+      const v: Visit = {
+        id: uid("v"), workerId: u.id, workerName: u.name, role: u.role, facilityId: u.facilityId,
+        ts: Date.now(), type: data.type, patientId: data.patientId, symptoms: data.symptoms,
+        complaint: data.complaint, observations: data.observations, notes: data.notes, location: data.location,
+      };
+      upsert(cache.visits, v);
+      queue("visit", "create", {
+        id: v.id, patient_id: data.patientId, worker_id: u.id, symptoms: data.symptoms,
+        complaint: data.complaint, observations: data.observations, notes: data.notes,
+        location: data.location, source: "FIELD",
+      }, `Visit — ${patientName(data.patientId)}`);
+      return v;
+    }
+    const v = mapVisit(await rq<AnyObj>("POST", `/patients/${data.patientId}/visits`, {
+      body: { symptoms: data.symptoms, complaint: data.complaint, observations: data.observations, notes: data.notes, location: data.location },
+    }));
+    upsert(cache.visits, v);
+    recordSynced("visit", `Visit — ${patientName(data.patientId)}`);
     save();
     return v;
   },
 
   async createVitals(user: User | null, data: { patientId: string; sys?: number; dia?: number; temp?: number; spo2?: number; hr?: number; rr?: number; weight?: number; device?: string }) {
-    await wait();
     const u = requireUser(user);
-    requirePerm(u, "vitals.create");
-    const db = getDB();
-    const v = { id: uid("vt"), workerId: u.id, workerName: u.name, facilityId: u.facilityId, ts: Date.now(), ...data };
-    db.vitals.unshift(v);
-    queueOp("vitals", `Vitals — ${patientName(data.patientId)}`);
-    audit(u.id, u.name, u.role, "CREATE_VITALS", "vitals", { patientId: data.patientId });
+    if (offlineProbe()) {
+      const v: Vitals = {
+        id: uid("vt"), workerId: u.id, workerName: u.name, facilityId: u.facilityId, ts: Date.now(),
+        patientId: data.patientId, sys: data.sys, dia: data.dia, temp: data.temp, spo2: data.spo2,
+        hr: data.hr, rr: data.rr, weight: data.weight, device: data.device,
+      };
+      upsert(cache.vitals, v);
+      queue("vital", "create", {
+        id: v.id, patient_id: data.patientId, recorded_by_id: u.id,
+        systolic: data.sys, diastolic: data.dia, temperature: data.temp, spo2: data.spo2,
+        heart_rate: data.hr, respiratory_rate: data.rr, weight_kg: data.weight, device: data.device,
+      }, `Vitals — ${patientName(data.patientId)}`);
+      return v;
+    }
+    const v = mapVitals(await rq<AnyObj>("POST", `/patients/${data.patientId}/vitals`, {
+      body: {
+        systolic: data.sys, diastolic: data.dia, temperature: data.temp, spo2: data.spo2,
+        heart_rate: data.hr, respiratory_rate: data.rr, weight_kg: data.weight, device: data.device,
+      },
+    }));
+    upsert(cache.vitals, v);
+    recordSynced("vitals", `Vitals — ${patientName(data.patientId)}`);
     save();
     return v;
   },
 
-  /* ---- triage (POST /triage/assess) */
+  /* ---- triage (POST /triage/assess — decision support, not a diagnosis) */
   async assessTriage(user: User | null, patientId: string, input: TriageInput) {
-    await wait(650);
     const u = requireUser(user);
-    requirePerm(u, "triage.run");
-    const db = getDB();
-    const result = assessRisk(input);
-    const a = {
-      id: uid("as"), patientId, workerId: u.id, workerName: u.name, role: u.role, ts: Date.now(),
-      inputs: { ...input }, level: result.level, factors: result.factors,
-      recommendation: result.recommendation, version: result.version, confirmed: false,
-    };
-    db.assessments.unshift(a);
-    queueOp("triage", `Triage (${result.level}) — ${patientName(patientId)}`);
-    audit(u.id, u.name, u.role, "TRIAGE_ASSESS", "triage", { patientId, details: `${result.level} — ${result.factors.length} factors` });
-    if (result.level === "HIGH" || result.level === "CRITICAL") {
-      notify({ targetRole: "PHC_DOCTOR", targetFacilityId: db.patients.find(p => p.id === patientId)?.phcId, title: `${result.level}-risk assessment`, body: `${patientName(patientId)} flagged ${result.level} by ${u.name}. Review recommended.`, kind: result.level === "CRITICAL" ? "critical" : "warning", link: `/app/patients/${patientId}` });
+    const has = (...keys: string[]) => input.symptoms.some(s => keys.some(k => s.toLowerCase().includes(k)));
+    if (offlineProbe()) {
+      // Same deterministic rules run locally; queued for the server as an assessment event.
+      const result = assessRisk(input);
+      const weights: Record<TriageFactor["severity"], number> = { critical: 50, high: 25, warn: 15, info: 5 };
+      const factors = result.factors.map(f => ({ code: f.detail || "FACTOR", label: f.label, weight: weights[f.severity] }));
+      const a: Assessment = {
+        id: uid("as"), patientId, workerId: u.id, workerName: u.name, role: u.role, ts: Date.now(),
+        inputs: { ...input }, level: result.level, factors: result.factors,
+        recommendation: result.recommendation, version: result.version, confirmed: false,
+      };
+      upsert(cache.assessments, a);
+      queue("assessment", "create", {
+        id: a.id, patient_id: patientId, level: result.level,
+        score: factors.reduce((s, f) => s + f.weight, 0), factors,
+        red_flags: result.factors.filter(f => f.severity === "critical" || f.severity === "high").map(f => f.label),
+        recommendation: result.recommendation, rule_version: result.version,
+        input_snapshot: {
+          age: input.age, spo2: input.spo2, temperature: input.temp, heart_rate: input.hr,
+          respiratory_rate: input.rr, cough: has("cough"), breathing_difficulty: has("breath"),
+          chest_pain: has("chest"), pregnant: !!input.pregnant, conditions: input.conditions,
+          severity_reported: input.severity, symptoms: input.symptoms,
+        },
+        confirmed: false,
+      }, `Triage (${result.level}) — ${patientName(patientId)}`);
+      return a;
     }
+    const res = await rq<AnyObj>("POST", "/triage/assess", {
+      body: {
+        patient_id: patientId, age: input.age, spo2: input.spo2, respiratory_rate: input.rr,
+        temperature: input.temp, heart_rate: input.hr, cough: has("cough"),
+        breathing_difficulty: has("breath"), chest_pain: has("chest"),
+        pregnant: !!input.pregnant, conditions: input.conditions,
+        severity_reported: input.severity, symptoms: input.symptoms,
+      },
+    });
+    const a: Assessment = {
+      id: res.assessment_id ?? uid("as"), patientId, workerId: u.id, workerName: u.name, role: u.role,
+      ts: Date.now(), inputs: { ...input }, level: res.risk_level,
+      factors: (res.contributing_factors ?? []).map(mapFactor),
+      recommendation: res.recommended_action, version: res.rule_version, confirmed: false,
+    };
+    upsert(cache.assessments, a);
+    recordSynced("triage", `Triage (${a.level}) — ${patientName(patientId)}`);
     save();
     return a;
   },
 
   async confirmAssessment(user: User | null, assessmentId: string) {
-    await wait();
     const u = requireUser(user);
-    requirePerm(u, "triage.confirm");
-    const db = getDB();
-    const a = db.assessments.find(x => x.id === assessmentId);
-    if (!a) throw new ApiError(404, "Assessment not found.");
-    a.confirmed = true; a.confirmedBy = u.name; a.confirmedAt = Date.now();
-    audit(u.id, u.name, u.role, "CONFIRM_TRIAGE", "triage", { patientId: a.patientId, details: `Confirmed ${a.level}` });
+    requireOnline();
+    await rq("POST", `/triage/assessments/${assessmentId}/confirm`);
+    const a = cache.assessments.find(x => x.id === assessmentId);
+    if (a) { a.confirmed = true; a.confirmedBy = u.name; a.confirmedAt = Date.now(); }
     save();
     return a;
   },
 
   /* ---- referrals */
   async listReferrals(user: User | null, opts?: { patientId?: string }) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    let list = db.referrals;
-    if (u.role === "PATIENT") {
-      const me = db.patients.find(p => p.name === u.name || p.id === `p-${u.id.replace("u-", "")}`);
-      list = list.filter(r => r.patientId === me?.id);
-    } else if (u.role === "ASHA" || u.role === "ANM") {
-      const myPatients = new Set(db.patients.filter(p => p.ashaId === u.id).map(p => p.id));
-      list = list.filter(r => myPatients.has(r.patientId) || r.createdBy === u.id);
-    } else if (u.role === "PHC_DOCTOR" || u.role === "PHC_STAFF") {
-      list = list.filter(r => r.fromFacilityId === u.facilityId || r.toFacilityId === u.facilityId);
-    } else if (u.role === "CHC_DOCTOR") {
-      list = list.filter(r => r.fromFacilityId === u.facilityId || r.toFacilityId === u.facilityId);
-    }
-    if (opts?.patientId) list = list.filter(r => r.patientId === opts.patientId);
-    return [...list].sort((a, b) => b.ts - a.ts);
+    return listReferralsFor(requireUser(user), opts);
   },
 
   async getReferral(user: User | null, id: string) {
-    await wait();
-    const u = requireUser(user);
-    const r = getDB().referrals.find(x => x.id === id);
-    if (!r) throw new ApiError(404, "Referral not found.");
-    if (u.role === "PATIENT") {
-      const me = getDB().patients.find(p => p.name === u.name);
-      if (r.patientId !== me?.id) throw new ApiError(403, "Not your referral.");
-    }
+    requireUser(user);
+    const detail = await rq<AnyObj>("GET", `/referrals/${id}`);
+    const r = mapReferral(detail, detail.events ?? []);
+    upsert(cache.referrals, r);
     return r;
   },
 
   async createReferral(user: User | null, data: { patientId: string; fromFacilityId: string; toFacilityId: string; reason: string; priority: Priority; clinicalSummary: string; vitalsSnapshot?: string; expectedDate: string; followUpDate?: string }) {
-    await wait(500);
     const u = requireUser(user);
     requirePerm(u, "referral.create");
-    const db = getDB();
-    const serial = String(220 + db.referrals.length).padStart(5, "0");
-    const now = Date.now();
-    const r: Referral = {
-      id: uid("ref"), code: `RAK-REF-2026-${serial}`, patientId: data.patientId,
-      fromFacilityId: data.fromFacilityId, toFacilityId: data.toFacilityId,
-      createdBy: u.id, createdByName: u.name, creatorRole: u.role, ts: now,
-      reason: data.reason, priority: data.priority, clinicalSummary: data.clinicalSummary,
-      vitalsSnapshot: data.vitalsSnapshot, expectedDate: data.expectedDate, status: "SENT",
-      events: [
-        { id: uid("rev"), ts: now, actorId: u.id, actorName: u.name, role: u.role, from: null, to: "CREATED", facilityId: data.fromFacilityId },
-        { id: uid("rev"), ts: now + 1, actorId: u.id, actorName: u.name, role: u.role, from: "CREATED", to: "SENT", facilityId: data.fromFacilityId, notes: "Dispatched via RAKSHA network" },
-      ],
+    const payload: AnyObj = {
+      patient_id: data.patientId, from_facility_id: data.fromFacilityId, to_facility_id: data.toFacilityId,
+      reason: data.reason, priority: data.priority, clinical_summary: data.clinicalSummary,
+      vitals_snapshot: data.vitalsSnapshot, expected_date: data.expectedDate,
     };
-    db.referrals.unshift(r);
-    if (data.followUpDate) {
-      db.followups.unshift({ id: uid("fu"), patientId: data.patientId, referralId: r.id, date: data.followUpDate, assigneeRole: u.role === "ASHA" || u.role === "ANM" ? u.role : "ASHA", assigneeId: u.role === "ASHA" || u.role === "ANM" ? u.id : db.patients.find(p => p.id === data.patientId)?.ashaId, notes: `Post-referral follow-up (${facilityName(data.toFacilityId)})`, status: "SCHEDULED" });
+    if (offlineProbe()) {
+      const now = Date.now();
+      const localId = uid("ref");
+      const r: Referral = {
+        id: localId, code: "REF-PENDING-SYNC", patientId: data.patientId,
+        fromFacilityId: data.fromFacilityId, toFacilityId: data.toFacilityId,
+        createdBy: u.id, createdByName: u.name, creatorRole: u.role, ts: now,
+        reason: data.reason, priority: data.priority, clinicalSummary: data.clinicalSummary,
+        vitalsSnapshot: data.vitalsSnapshot, expectedDate: data.expectedDate, status: "SENT",
+        events: [
+          { id: uid("rev"), ts: now, actorId: u.id, actorName: u.name, role: u.role, from: null, to: "CREATED", facilityId: data.fromFacilityId },
+          { id: uid("rev"), ts: now + 1, actorId: u.id, actorName: u.name, role: u.role, from: "CREATED", to: "SENT", facilityId: data.fromFacilityId, notes: "Queued offline — dispatches on sync" },
+        ],
+      };
+      upsert(cache.referrals, r);
+      queue("referral", "create", { ...payload, id: localId, created_by_id: u.id }, `Referral — ${patientName(data.patientId)}`);
+      if (data.followUpDate) {
+        const f: FollowUp = { id: uid("fu"), patientId: data.patientId, referralId: localId, date: data.followUpDate, assigneeRole: "ASHA", notes: `Post-referral follow-up (${facilityName(data.toFacilityId)})`, status: "SCHEDULED" };
+        upsert(cache.followups, f);
+        queue("followup", "create", { id: f.id, patient_id: data.patientId, referral_id: localId, scheduled_date: data.followUpDate, notes: f.notes, assignee_role: "ASHA" }, `Follow-up — ${patientName(data.patientId)}`);
+      }
+      return r;
     }
-    queueOp("referral", `Referral — ${patientName(data.patientId)}`);
-    audit(u.id, u.name, u.role, "CREATE_REFERRAL", "referral", { patientId: data.patientId, details: `${r.code} ${facilityName(data.fromFacilityId)} → ${facilityName(data.toFacilityId)}` });
-    const dest = db.facilities.find(f => f.id === data.toFacilityId);
-    const destRole: Role = dest?.type === "DH" ? "SPECIALIST" : "CHC_DOCTOR";
-    notify({ targetRole: destRole, targetFacilityId: data.toFacilityId, title: `New referral — ${data.priority}`, body: `${patientName(data.patientId)} referred from ${facilityName(data.fromFacilityId)}. ${data.reason}`, kind: data.priority === "EMERGENCY" || data.priority === "URGENT" ? "critical" : "warning", link: `/app/referrals/${r.id}` });
-    notify({ targetRole: "PHC_DOCTOR", targetFacilityId: data.fromFacilityId, title: "Referral dispatched", body: `${r.code} for ${patientName(data.patientId)} sent to ${facilityName(data.toFacilityId)}.`, kind: "info", link: `/app/referrals/${r.id}` });
+    const created = await rq<AnyObj>("POST", "/referrals", { body: payload });
+    if (data.followUpDate) {
+      await rq("POST", `/referrals/${created.id}/followup`, {
+        body: { scheduled_date: data.followUpDate, notes: `Post-referral follow-up (${facilityName(data.toFacilityId)})`, assignee_role: "ASHA" },
+      });
+    }
+    const detail = await rq<AnyObj>("GET", `/referrals/${created.id}`);
+    const r = mapReferral(detail, detail.events ?? []);
+    upsert(cache.referrals, r);
+    recordSynced("referral", `Referral — ${patientName(data.patientId)}`);
     save();
     return r;
   },
 
   async advanceReferral(user: User | null, id: string, to: RefStatus, notes?: string) {
-    await wait(420);
-    const u = requireUser(user);
-    const db = getDB();
-    const r = db.referrals.find(x => x.id === id);
-    if (!r) throw new ApiError(404, "Referral not found.");
-    const allowed = nextStatuses(r.status);
-    if (!allowed.includes(to)) throw new ApiError(409, `Cannot move from ${r.status} to ${to}.`);
-    const fieldWorker = u.role === "ASHA" || u.role === "ANM";
-    if (to === "ARRIVED" && fieldWorker) requirePerm(u, "referral.arrived");
-    else if (to === "CANCELLED" && fieldWorker) throw new ApiError(403, "Only clinical staff can cancel a referral.");
-    else requirePerm(u, "referral.advance");
-    if (!fieldWorker && u.role !== "SPECIALIST" && u.facilityId !== r.toFacilityId && to !== "CANCELLED")
-      throw new ApiError(403, "Only the receiving facility can advance this referral.");
-    const from = r.status;
-    r.status = to;
-    r.events.push({ id: uid("rev"), ts: Date.now(), actorId: u.id, actorName: u.name, role: u.role, from, to, facilityId: to === "CANCELLED" ? r.fromFacilityId : r.toFacilityId, notes });
-    if (to === "COMPLETED") r.completedAt = Date.now();
-    queueOp("referral.status", `${r.code}: ${from} → ${to}`);
-    audit(u.id, u.name, u.role, "REFERRAL_STATUS", "referral", { patientId: r.patientId, details: `${r.code}: ${from} → ${to}` });
-    if (to === "ACKNOWLEDGED" || to === "ACCEPTED") {
-      notify({ targetRole: r.creatorRole, targetUserId: r.createdBy, title: `Referral ${to.toLowerCase()}`, body: `${facilityName(r.toFacilityId)} ${to.toLowerCase()} ${r.code} (${patientName(r.patientId)}).`, kind: "success", link: `/app/referrals/${r.id}` });
-    }
-    if (to === "COMPLETED") {
-      const pat = db.patients.find(p => p.id === r.patientId);
-      const patUser = db.users.find(x => x.role === "PATIENT" && x.name === pat?.name);
-      if (patUser) notify({ targetRole: "PATIENT", targetUserId: patUser.id, title: "Referral completed", body: `Your care at ${facilityName(r.toFacilityId)} is complete. A follow-up may be scheduled.`, kind: "success", link: "/app/referrals" });
-      notify({ targetRole: "DISTRICT_ADMIN", title: "Referral loop closed", body: `${r.code} completed at ${facilityName(r.toFacilityId)}.`, kind: "success" });
-    }
+    requireUser(user);
+    requireOnline();
+    const detail = await rq<AnyObj>("POST", `/referrals/${id}/transition`, { body: { target: to, notes } });
+    const r = mapReferral(detail, detail.events ?? []);
+    upsert(cache.referrals, r);
+    recordSynced("referral.status", `${r.code} → ${to}`);
     save();
     return r;
   },
 
+  /* ---- follow-ups */
   async scheduleFollowUp(user: User | null, data: { patientId: string; referralId?: string; date: string; notes: string; assigneeRole: Role }) {
-    await wait();
     const u = requireUser(user);
-    requirePerm(u, "followup.create");
-    const db = getDB();
-    const f: FollowUp = { id: uid("fu"), ...data, status: "SCHEDULED" };
-    db.followups.unshift(f);
-    queueOp("followup", `Follow-up — ${patientName(data.patientId)}`);
-    audit(u.id, u.name, u.role, "SCHEDULE_FOLLOWUP", "followup", { patientId: data.patientId, details: data.date });
-    notify({ targetRole: data.assigneeRole === "ASHA" || data.assigneeRole === "ANM" ? data.assigneeRole : "ASHA", targetUserId: data.assigneeRole === u.role ? u.id : undefined, title: "Follow-up scheduled", body: `${patientName(data.patientId)} — ${data.date}. ${data.notes}`, kind: "info", link: "/app/followups" });
+    if (offlineProbe()) {
+      const f: FollowUp = { id: uid("fu"), ...data, status: "SCHEDULED" };
+      upsert(cache.followups, f);
+      queue("followup", "create", {
+        id: f.id, patient_id: data.patientId, referral_id: data.referralId,
+        scheduled_date: data.date, notes: data.notes, assignee_role: data.assigneeRole,
+      }, `Follow-up — ${patientName(data.patientId)}`);
+      return f;
+    }
+    const body = { scheduled_date: data.date, notes: data.notes, assignee_role: data.assigneeRole };
+    const raw = data.referralId
+      ? await rq<AnyObj>("POST", `/referrals/${data.referralId}/followup`, { body })
+      : await rq<AnyObj>("POST", `/patients/${data.patientId}/followups`, { body: { ...body, referral_id: data.referralId } });
+    const f = mapFollowUp(raw);
+    upsert(cache.followups, f);
+    recordSynced("followup", `Follow-up — ${patientName(data.patientId)}`);
     save();
     return f;
   },
 
   async listFollowUps(user: User | null) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    let list = db.followups;
-    if (u.role === "ASHA" || u.role === "ANM") list = list.filter(f => f.assigneeId === u.id || f.assigneeRole === u.role);
-    else if (u.role === "PATIENT") {
-      const me = db.patients.find(p => p.name === u.name);
-      list = list.filter(f => f.patientId === me?.id);
-    }
+    requireUser(user);
+    if (offlineProbe()) return [...cache.followups].sort((a, b) => a.date.localeCompare(b.date));
+    const rows = await rq<AnyObj[]>("GET", "/followups/all");
+    const list = rows.map(mapFollowUp);
+    mergeMany(cache.followups, list);
     return [...list].sort((a, b) => a.date.localeCompare(b.date));
   },
 
   async completeFollowUp(user: User | null, id: string, notes?: string) {
-    await wait();
-    const u = requireUser(user);
-    requirePerm(u, u.role === "ASHA" || u.role === "ANM" ? "followup.complete" : "followup.create");
-    const db = getDB();
-    const f = db.followups.find(x => x.id === id);
-    if (!f) throw new ApiError(404, "Follow-up not found.");
-    f.status = "COMPLETED"; f.completedAt = Date.now(); f.completedBy = u.name;
+    requireUser(user);
+    requireOnline();
+    const raw = await rq<AnyObj>("PATCH", `/followups/${id}/complete`);
+    const f = mapFollowUp(raw);
     if (notes) f.notes = `${f.notes} · ${notes}`;
-    queueOp("followup.complete", `Follow-up done — ${patientName(f.patientId)}`);
-    audit(u.id, u.name, u.role, "COMPLETE_FOLLOWUP", "followup", { patientId: f.patientId });
+    upsert(cache.followups, f);
     save();
     return f;
   },
 
   /* ---- consultations */
   async createConsultation(user: User | null, data: { patientId: string; complaint: string; findings: string; assessment: string; plan: string; followUpDate?: string; meds?: { name: string; dose: string; duration: string }[]; investigation?: string }) {
-    await wait(500);
     const u = requireUser(user);
-    requirePerm(u, "consult.create");
-    const db = getDB();
-    const c = { id: uid("c"), patientId: data.patientId, doctorId: u.id, doctorName: u.name, specialty: u.specialty, facilityId: u.facilityId ?? "F-DH-01", ts: Date.now(), complaint: data.complaint, findings: data.findings, assessment: data.assessment, plan: data.plan, followUpDate: data.followUpDate };
-    db.consultations.unshift(c);
-    let rx = null;
-    if (data.meds && data.meds.length > 0) {
-      rx = { id: uid("rx"), patientId: data.patientId, doctorId: u.id, doctorName: u.name, facilityId: c.facilityId, ts: Date.now(), meds: data.meds };
-      db.prescriptions.unshift(rx);
-      audit(u.id, u.name, u.role, "CREATE_PRESCRIPTION", "prescription", { patientId: data.patientId });
-    }
+    requireOnline();
+    const raw = await rq<AnyObj>("POST", `/patients/${data.patientId}/consultations`, {
+      body: {
+        complaint: data.complaint, findings: data.findings, assessment: data.assessment, plan: data.plan,
+        investigation: data.investigation, follow_up_date: data.followUpDate || null,
+        meds: (data.meds ?? []).map(m => ({ medicine: m.name, dose: m.dose, duration: m.duration })),
+      },
+    });
+    const c = mapConsultation(raw);
+    upsert(cache.consultations, c);
+    const rx = prescriptionFrom(raw);
+    if (rx) upsert(cache.prescriptions, rx);
     if (data.investigation) {
-      db.diagnostics.unshift({ id: uid("dg"), patientId: data.patientId, orderedById: u.id, orderedByName: u.name, facilityId: c.facilityId, ts: Date.now(), test: data.investigation, status: "ORDERED" });
-      audit(u.id, u.name, u.role, "ORDER_DIAGNOSTIC", "diagnostic", { patientId: data.patientId, details: data.investigation });
+      upsert(cache.diagnostics, {
+        id: uid("dg"), patientId: data.patientId, orderedById: u.id, orderedByName: u.name,
+        facilityId: c.facilityId, ts: Date.now(), test: data.investigation, status: "ORDERED",
+      });
     }
-    if (data.followUpDate) {
-      const pat = db.patients.find(p => p.id === data.patientId);
-      db.followups.unshift({ id: uid("fu"), patientId: data.patientId, date: data.followUpDate, assigneeRole: "ASHA", assigneeId: pat?.ashaId, notes: `Post-consultation review (${u.name})`, status: "SCHEDULED" });
-    }
-    queueOp("consultation", `Consultation — ${patientName(data.patientId)}`);
-    audit(u.id, u.name, u.role, "CREATE_CONSULTATION", "consultation", { patientId: data.patientId });
+    recordSynced("consultation", `Consultation — ${patientName(data.patientId)}`);
     save();
     return { consultation: c, prescription: rx };
   },
 
-  /* ---- emergency */
+  /* ---- emergency (POST /emergency-events) */
   async createEmergency(user: User | null, patientId: string, clinicalNote: string) {
-    await wait(550);
-    const u = requireUser(user);
-    requirePerm(u, "emergency.create");
-    const db = getDB();
-    const serial = String(22 + db.emergencies.length).padStart(5, "0");
-    const token = Array.from({ length: 6 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
-    const e = {
-      id: uid("emg"), code: `EMG-RAK-2026-${serial}`, patientId, doctorId: u.id, doctorName: u.name,
-      facilityId: u.facilityId ?? "F-DH-01", ts: Date.now(), severity: "CRITICAL" as const, clinicalNote,
-      status: "ACTIVE" as const, smsToken: token, smsExpiresAt: Date.now() + 10 * 60000, smsRedeemed: false,
-      smsLog: [`${new Date().toISOString()} — one-time token generated (10 min expiry)`, `${new Date().toISOString()} — push dispatched via notification adapter (FCM integration point, demo)`],
-    };
-    db.emergencies.unshift(e);
-    queueOp("emergency", `Emergency — ${patientName(patientId)}`);
-    audit(u.id, u.name, u.role, "CREATE_EMERGENCY", "emergency", { patientId, details: e.code });
-    notify({ targetRole: "DISTRICT_ADMIN", title: "CRITICAL case flagged", body: `${e.code} created at ${facilityName(e.facilityId)} for ${patientName(patientId)}.`, kind: "critical", link: "/app/dashboard" });
-    notify({ targetRole: "SPECIALIST", targetFacilityId: "F-DH-01", title: "Emergency escalation", body: `${patientName(patientId)} — ${clinicalNote}`, kind: "critical", link: "/app/emergency" });
+    requireUser(user);
+    requireOnline();
+    const raw = await rq<AnyObj>("POST", "/emergency-events", { body: { patient_id: patientId, clinical_note: clinicalNote } });
+    const e = mapEmergency(raw);
+    upsert(cache.emergencies, e);
     save();
     return e;
   },
 
   async listEmergencies(user: User | null) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    let list = db.emergencies;
-    if (u.role === "PATIENT") {
-      const me = db.patients.find(p => p.name === u.name || p.id === `p-${u.id.replace("u-", "")}`);
-      list = list.filter(e => e.patientId === me?.id);
-    }
+    requireUser(user);
+    const rows = await rq<AnyObj[]>("GET", "/emergency-events");
+    const list = rows.map(mapEmergency);
+    mergeMany(cache.emergencies, list);
     return [...list].sort((a, b) => b.ts - a.ts);
   },
 
   async redeemSmsCommand(user: User | null, eventId: string, token: string) {
-    await wait(350);
-    const u = requireUser(user);
-    const db = getDB();
-    const e = db.emergencies.find(x => x.id === eventId);
-    if (!e) throw new ApiError(404, "Emergency event not found.");
-    if (e.smsRedeemed) { e.smsLog.push(`${new Date().toISOString()} — REJECTED: token replay blocked`); save(); throw new ApiError(409, "Token already redeemed — replay blocked."); }
-    if (Date.now() > e.smsExpiresAt) { e.smsLog.push(`${new Date().toISOString()} — REJECTED: token expired`); save(); throw new ApiError(410, "One-time token expired."); }
-    if (token.trim().toUpperCase() !== e.smsToken) { e.smsLog.push(`${new Date().toISOString()} — REJECTED: invalid token`); save(); throw new ApiError(401, "Invalid one-time token."); }
-    e.smsRedeemed = true; e.status = "ACKNOWLEDGED"; e.ackBy = u.name; e.ackAt = Date.now();
-    e.smsLog.push(`${new Date().toISOString()} — ACCEPTED: command EMERGENCY|${e.code}|${e.smsToken} verified → alarm triggered`);
-    audit(u.id, u.name, u.role, "EMERGENCY_ACK", "emergency", { patientId: e.patientId, details: `${e.code} token redeemed` });
+    requireUser(user);
+    requireOnline();
+    const raw = await rq<AnyObj>("POST", `/emergency-events/${eventId}/redeem`, { body: { token } });
+    const e = mapEmergency(raw);
+    upsert(cache.emergencies, e);
     save();
     return e;
   },
 
   async resolveEmergency(user: User | null, eventId: string) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    const e = db.emergencies.find(x => x.id === eventId);
-    if (!e) throw new ApiError(404, "Emergency event not found.");
-    e.status = "RESOLVED";
-    audit(u.id, u.name, u.role, "EMERGENCY_RESOLVE", "emergency", { patientId: e.patientId, details: e.code });
+    requireUser(user);
+    requireOnline();
+    const raw = await rq<AnyObj>("PATCH", `/emergency-events/${eventId}/status`, { body: { status: "RESOLVED" } });
+    const e = mapEmergency(raw);
+    upsert(cache.emergencies, e);
     save();
     return e;
   },
 
   /* ---- appointments */
   async listAppointments(user: User | null) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    let list = db.appointments;
-    if (u.role === "PATIENT") {
-      const me = db.patients.find(p => p.name === u.name);
-      list = list.filter(a => a.patientId === me?.id);
-    } else if (u.role === "PHC_STAFF" || u.role === "PHC_DOCTOR") list = list.filter(a => a.facilityId === u.facilityId);
+    requireUser(user);
+    const rows = await rq<AnyObj[]>("GET", "/appointments");
+    const list = rows.map(mapAppointment);
+    mergeMany(cache.appointments, list);
     return [...list].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
   },
 
   async bookAppointment(user: User | null, data: { facilityId: string; date: string; time: string; purpose: string }) {
-    await wait();
     const u = requireUser(user);
-    const db = getDB();
-    const me = db.patients.find(p => p.name === u.name);
-    if (!me) throw new ApiError(404, "Patient profile not found.");
     requirePerm(u, "appointment.book");
-    const a = { id: uid("ap"), patientId: me.id, ...data, status: "REQUESTED" as const };
-    db.appointments.push(a);
-    queueOp("appointment", `Appointment — ${me.name}`);
-    audit(u.id, u.name, u.role, "BOOK_APPOINTMENT", "appointment", { patientId: me.id, details: `${facilityName(data.facilityId)} ${data.date}` });
-    notify({ targetRole: "PHC_STAFF", targetFacilityId: data.facilityId, title: "Appointment request", body: `${me.name} requests ${data.purpose} on ${data.date} ${data.time}.`, kind: "info" });
+    requireOnline();
+    const page = await rq<AnyObj>("GET", "/patients?limit=10");
+    const me = (page.items ?? []).map(mapPatient)[0];
+    if (!me) throw new ApiError(404, "Patient profile not found for this login.");
+    const raw = await rq<AnyObj>("POST", "/appointments", {
+      body: { patient_id: me.id, facility_id: data.facilityId, date: data.date, time: data.time, purpose: data.purpose, appointment_type: "OPD" },
+    });
+    const a = mapAppointment(raw);
+    a.status = "REQUESTED";
+    upsert(cache.appointments, a);
     save();
     return a;
   },
 
-  /* ---- teleconsultation */
+  /* ---- teleconsultation (session metadata only — no video provider wired) */
   async listTele(user: User | null) {
-    await wait();
-    const u = requireUser(user);
-    const db = getDB();
-    let list = db.teles;
-    if (u.role === "PATIENT") {
-      const me = db.patients.find(p => p.name === u.name);
-      list = list.filter(t => t.patientId === me?.id);
-    } else if (u.role === "SPECIALIST" || u.role === "CHC_DOCTOR" || u.role === "PHC_DOCTOR") list = list.filter(t => t.doctorId === u.id || t.facilityId === u.facilityId);
+    requireUser(user);
+    const rows = await rq<AnyObj[]>("GET", "/teleconsultations");
+    const list = rows.map(mapTele);
+    mergeMany(cache.teles, list);
     return [...list].sort((a, b) => b.scheduledAt - a.scheduledAt);
   },
 
+  /** Local prototype step: the backend has no in-call status, so "joining"
+   *  only flips the replica until the outcome is recorded. */
   async startTele(user: User | null, id: string) {
-    await wait(400);
-    const u = requireUser(user);
-    const db = getDB();
-    const t = db.teles.find(x => x.id === id);
+    requireUser(user);
+    const t = cache.teles.find(x => x.id === id);
     if (!t) throw new ApiError(404, "Teleconsultation not found.");
     t.status = "IN_PROGRESS"; t.startedAt = Date.now();
-    audit(u.id, u.name, u.role, "TELE_START", "teleconsultation", { patientId: t.patientId, details: t.roomCode });
     save();
     return t;
   },
 
   async completeTele(user: User | null, id: string, data: { summary: string; recommendation: string; followUp?: string }) {
-    await wait(450);
     const u = requireUser(user);
-    const db = getDB();
-    const t = db.teles.find(x => x.id === id);
-    if (!t) throw new ApiError(404, "Teleconsultation not found.");
-    t.status = "COMPLETED"; t.completedAt = Date.now();
-    t.summary = data.summary; t.recommendation = data.recommendation; t.followUp = data.followUp;
-    db.consultations.unshift({ id: uid("c"), patientId: t.patientId, doctorId: u.id, doctorName: u.name, specialty: u.specialty, facilityId: t.facilityId, ts: Date.now(), complaint: `Teleconsultation ${t.roomCode}`, findings: data.summary, assessment: data.recommendation, plan: data.followUp ?? "As advised", isTele: true });
+    requireOnline();
+    const raw = await rq<AnyObj>("PATCH", `/teleconsultations/${id}/complete`, {
+      body: { assessment: data.summary, recommendation: data.recommendation, follow_up_date: data.followUp || null },
+    });
+    const t = mapTele(raw);
+    t.completedAt = Date.now();
+    upsert(cache.teles, t);
+    upsert(cache.consultations, {
+      id: uid("c"), patientId: t.patientId, doctorId: u.id, doctorName: u.name, specialty: u.specialty,
+      facilityId: t.facilityId, ts: Date.now(), complaint: `Teleconsultation ${t.roomCode}`,
+      findings: data.summary, assessment: data.recommendation, plan: data.followUp ?? "As advised", isTele: true,
+    });
     if (data.followUp) {
-      const pat = db.patients.find(p => p.id === t.patientId);
-      db.followups.unshift({ id: uid("fu"), patientId: t.patientId, date: todayISO(7), assigneeRole: "ASHA", assigneeId: pat?.ashaId, notes: `Post-teleconsult (${u.name}): ${data.followUp}`, status: "SCHEDULED" });
+      await rq("POST", `/patients/${t.patientId}/followups`, {
+        body: { scheduled_date: todayISO(7), notes: `Post-teleconsult (${u.name}): ${data.followUp}`, assignee_role: "ASHA" },
+      }).catch(() => undefined);
     }
-    queueOp("teleconsultation", `Teleconsult note — ${patientName(t.patientId)}`);
-    audit(u.id, u.name, u.role, "TELE_COMPLETE", "teleconsultation", { patientId: t.patientId, details: t.roomCode });
     save();
     return t;
   },
 
   /* ---- facilities */
   async listFacilities(user: User | null) {
-    await wait();
     requireUser(user);
-    return getDB().facilities;
+    return loadFacilities();
   },
 
   async recommendFacilities(user: User | null, opts: { fromFacilityId: string; needsEmergency?: boolean; needsOxygen?: boolean; specialty?: string }) {
-    await wait(500);
     requireUser(user);
-    const db = getDB();
-    const from = db.facilities.find(f => f.id === opts.fromFacilityId);
-    const tier: Record<string, number> = { SUBCENTRE: 0, PHC: 1, CHC: 2, DH: 3 };
-    const fromTier = tier[from?.type ?? "PHC"];
-    const scored = db.facilities
-      .filter(f => (tier[f.type] ?? 0) > fromTier)
-      .map(f => {
-        const reasons: string[] = [];
-        let score = 50;
-        const dist = Math.max(2, Math.abs(f.mapX - (from?.mapX ?? 40)) + Math.abs(f.mapY - (from?.mapY ?? 55))) * 0.6;
-        score -= dist * 0.35;
-        reasons.push(`${f.distanceKm} km from PHC network`);
-        if (f.availableBeds > 0) { score += Math.min(15, f.availableBeds); reasons.push(`${f.availableBeds} beds free`); } else score -= 20;
-        if (opts.needsEmergency && f.emergency) { score += 18; reasons.push("Emergency: available"); }
-        if (opts.needsEmergency && !f.emergency) score -= 25;
-        if (opts.needsOxygen && f.oxygen === "AVAILABLE") { score += 16; reasons.push("Oxygen: available"); }
-        if (f.oxygen === "UNAVAILABLE") score -= 12;
-        if (f.emergency) reasons.push("Emergency: available");
-        if (f.oxygen === "AVAILABLE") reasons.push("Oxygen: available");
-        if (opts.specialty && f.specialists.some(s => s.available && s.specialty.toLowerCase().includes(opts.specialty!.toLowerCase()))) { score += 20; reasons.push(`${opts.specialty}: available`); }
-        if (f.icuAvailable > 0) { score += 8; reasons.push(`${f.icuAvailable} ICU beds free`); }
-        if (f.workload === "LOW") score += 8; else if (f.workload === "HIGH") { score -= 12; }
-        reasons.push(`Current load: ${f.workload.toLowerCase()}`);
-        return { facility: f, score: Math.round(score), reasons };
-      })
-      .sort((a, b) => b.score - a.score);
-    return scored;
+    const needs: string[] = [];
+    if (opts.needsEmergency) needs.push("emergency");
+    if (opts.needsOxygen) needs.push("oxygen");
+    if (opts.specialty) needs.push(`specialty:${opts.specialty}`);
+    const recs = await rq<AnyObj[]>("POST", "/facilities/recommend", {
+      body: { from_facility_id: opts.fromFacilityId, priority: "PRIORITY", needs },
+    });
+    return Promise.all(recs.map(async rec => {
+      let facility = cache.facilities.find(f => f.id === rec.facility?.id);
+      if (!facility) {
+        let res: AnyObj | null = null;
+        try { res = await rq<AnyObj>("GET", `/facilities/${rec.facility.id}/resources`); } catch { res = null; }
+        facility = mapFacility(rec.facility, res);
+        upsert(cache.facilities, facility);
+      }
+      return { facility, score: rec.score as number, reasons: rec.reasons as string[] };
+    }));
   },
 
   /* ---- notifications */
   async listNotifications(user: User | null) {
-    await wait(200);
-    const u = requireUser(user);
-    const db = getDB();
-    const list = db.notifications.filter(n =>
-      n.targetRole === "ALL" || n.targetUserId === u.id ||
-      (n.targetRole === u.role && (!n.targetFacilityId || n.targetFacilityId === u.facilityId)) ||
-      (u.role === "DISTRICT_ADMIN"));
-    return [...list].sort((a, b) => b.ts - a.ts).slice(0, 40);
+    requireUser(user);
+    const rows = await rq<AnyObj[]>("GET", "/notifications");
+    const list = rows.map(mapNotification);
+    cache.notifications = list;
+    return list;
   },
 
   async markNotificationsRead(user: User | null) {
-    const u = requireUser(user);
-    const db = getDB();
-    db.notifications.forEach(n => {
-      if (n.targetRole === "ALL" || n.targetUserId === u.id || (n.targetRole === u.role && (!n.targetFacilityId || n.targetFacilityId === u.facilityId))) n.read = true;
-    });
+    requireUser(user);
+    await rq("POST", "/notifications/read-all");
+    cache.notifications.forEach(n => { n.read = true; });
     save();
   },
 
-  /* ---- timeline (GET /patients/{id}/timeline) */
+  /* ---- timeline (GET /patients/{id}/timeline + records hydration) */
   async getTimeline(user: User | null, patientId: string) {
-    await wait(420);
     const u = requireUser(user);
-    const db = getDB();
-    const access = await this.getPatient(user, patientId, "Longitudinal record review");
+    const access = await fetchPatientAccess(u, patientId, "Longitudinal record review");
     if (access.restricted) return { events: [] as TimelineEvent[], restricted: true, consent: access.consent };
-    const events: TimelineEvent[] = [];
-    const p = db.patients.find(x => x.id === patientId)!;
-    events.push({ kind: "registered", ts: p.createdAt, id: p.id, title: "Patient registered", subtitle: `${p.rakId} · ${p.village}`, data: {} });
-    db.visits.filter(v => v.patientId === patientId).forEach(v => events.push({ kind: "visit", ts: v.ts, id: v.id, title: `${v.type === "HOME_VISIT" ? "ASHA home visit" : v.type === "SUBCENTRE" ? "Sub-centre visit" : "PHC visit"}`, subtitle: v.complaint || v.symptoms.join(", "), facilityId: v.facilityId, data: { ...v } }));
-    db.vitals.filter(v => v.patientId === patientId).forEach(v => {
-      const bits = [v.sys ? `BP ${v.sys}/${v.dia}` : null, v.temp ? `${v.temp}°F` : null, v.spo2 ? `SpO₂ ${v.spo2}%` : null, v.hr ? `HR ${v.hr}` : null].filter(Boolean);
-      events.push({ kind: "vitals", ts: v.ts, id: v.id, title: "Vitals recorded", subtitle: bits.join(" · ") || "Weight check", facilityId: v.facilityId, data: { ...v } });
+
+    const [rawEvents, records, refs] = await Promise.all([
+      rq<AnyObj[]>("GET", `/patients/${patientId}/timeline`),
+      rq<AnyObj>("GET", `/patients/${patientId}/records`).catch(() => null),
+      listReferralsFor(u, { patientId }).catch(() => [] as Referral[]),
+    ]);
+
+    if (records) {
+      mergeMany(cache.visits, (records.visits ?? []).map(mapVisit));
+      mergeMany(cache.vitals, (records.vitals ?? []).map(mapVitals));
+      (records.consultations ?? []).forEach((c: AnyObj) => {
+        upsert(cache.consultations, mapConsultation(c));
+        const rx = prescriptionFrom(c);
+        if (rx) upsert(cache.prescriptions, rx);
+      });
+      mergeMany(cache.diagnostics, (records.diagnostics ?? []).map(mapDiagnostic));
+      mergeMany(cache.followups, (records.followups ?? []).map(mapFollowUp));
+    }
+
+    const byId = <T extends { id: string }>(arr: T[], id: string) => arr.find(x => x.id === id);
+    const events: TimelineEvent[] = rawEvents.map(e => {
+      const kind = e.kind === "teleconsultation" ? "teleconsult" : e.kind;
+      let data: Record<string, unknown> = {};
+      if (e.kind === "visit") data = { ...(byId(cache.visits, e.id) ?? {}) };
+      else if (e.kind === "vitals") data = { ...(byId(cache.vitals, e.id) ?? {}) };
+      else if (e.kind === "assessment") {
+        const a = byId(cache.assessments, e.id);
+        const level = a?.level ?? /—\s*([A-Z]+)$/.exec(e.title)?.[1];
+        data = a ? { ...a } : { level, workerName: "RAKSHA triage" };
+      }
+      else if (e.kind === "consultation") data = { ...(byId(cache.consultations, e.id) ?? {}) };
+      else if (e.kind === "diagnostic") data = { ...(byId(cache.diagnostics, e.id) ?? {}) };
+      else if (e.kind === "referral") data = { ...(byId(refs, e.id) ?? byId(cache.referrals, e.id) ?? {}) };
+      else if (e.kind === "followup") data = { ...(byId(cache.followups, e.id) ?? {}) };
+      else if (e.kind === "teleconsultation") data = { ...(byId(cache.teles, e.id) ?? {}) };
+      else if (e.kind === "emergency") data = { ...(byId(cache.emergencies, e.id) ?? {}) };
+      return { kind, ts: ep(e.ts), id: e.id, title: e.title, subtitle: e.subtitle ?? "", facilityId: undefined, data };
     });
-    db.assessments.filter(a => a.patientId === patientId).forEach(a => events.push({ kind: "assessment", ts: a.ts, id: a.id, title: `AI-assisted assessment — ${a.level}`, subtitle: `${a.factors.length} contributing factors · ${a.confirmed ? "clinician confirmed" : "awaiting confirmation"}`, data: { ...a } }));
-    db.consultations.filter(c => c.patientId === patientId).forEach(c => events.push({ kind: "consultation", ts: c.ts, id: c.id, title: `${c.isTele ? "Teleconsultation" : "Consultation"} — ${facilityName(c.facilityId)}`, subtitle: c.assessment, facilityId: c.facilityId, data: { ...c } }));
-    db.prescriptions.filter(rx => rx.patientId === patientId).forEach(rx => events.push({ kind: "prescription", ts: rx.ts, id: rx.id, title: "Prescription", subtitle: rx.meds.map(m => `${m.name} ${m.dose}`).join(" · "), facilityId: rx.facilityId, data: { ...rx } }));
-    db.diagnostics.filter(dg => dg.patientId === patientId).forEach(dg => events.push({ kind: "diagnostic", ts: dg.ts, id: dg.id, title: `${dg.test} — ${dg.status.toLowerCase()}`, subtitle: dg.result ?? `Ordered at ${facilityName(dg.facilityId)}`, facilityId: dg.facilityId, data: { ...dg } }));
-    db.referrals.filter(r => r.patientId === patientId).forEach(r => events.push({ kind: "referral", ts: r.ts, id: r.id, title: `Referral ${r.code}`, subtitle: `${facilityName(r.fromFacilityId)} → ${facilityName(r.toFacilityId)} · ${r.status.toLowerCase()}`, data: { ...r } }));
-    db.teles.filter(t => t.patientId === patientId).forEach(t => events.push({ kind: "teleconsult", ts: t.status === "COMPLETED" ? (t.completedAt ?? t.scheduledAt) : t.scheduledAt, id: t.id, title: `Teleconsultation — ${t.status.toLowerCase()}`, subtitle: t.summary ?? `${t.doctorName} · ${t.roomCode}`, facilityId: t.facilityId, data: { ...t } }));
-    db.followups.filter(f => f.patientId === patientId).forEach(f => events.push({ kind: "followup", ts: new Date(f.date + "T09:00:00").getTime(), id: f.id, title: `Follow-up — ${followUpState(f).replace("_", " ").toLowerCase()}`, subtitle: f.notes, data: { ...f } }));
-    db.emergencies.filter(e => e.patientId === patientId).forEach(e => events.push({ kind: "emergency", ts: e.ts, id: e.id, title: `Emergency event ${e.code}`, subtitle: e.clinicalNote, facilityId: e.facilityId, data: { ...e } }));
     events.sort((a, b) => b.ts - a.ts);
     return { events, restricted: false, consent: access.consent };
   },
 
-  /* ---- admin analytics (GET /admin/analytics) */
+  /* ---- admin */
   async adminAnalytics(user: User | null) {
-    await wait(550);
     const u = requireUser(user);
     requirePerm(u, "admin.read");
-    const db = getDB();
-    const active = db.referrals.filter(r => !["COMPLETED", "CANCELLED"].includes(r.status));
-    const completed = db.referrals.filter(r => r.status === "COMPLETED");
-    const latestAssessmentByPatient = new Map<string, (typeof db.assessments)[number]>();
-    db.assessments.forEach(a => { if (!latestAssessmentByPatient.has(a.patientId)) latestAssessmentByPatient.set(a.patientId, a); });
-    const latest = [...latestAssessmentByPatient.values()];
-    const highRisk = latest.filter(a => a.level === "HIGH").length;
-    const critical = latest.filter(a => a.level === "CRITICAL").length + db.emergencies.filter(e => e.status === "ACTIVE").length;
-    const missed = db.followups.filter(f => followUpState(f) === "OVERDUE").length;
-    const weeks: { label: string; patients: number; visits: number }[] = [];
-    for (let i = 7; i >= 0; i--) {
-      const start = Date.now() - (i + 1) * 7 * 86400000, end = Date.now() - i * 7 * 86400000;
-      weeks.push({
-        label: `W-${i}`,
-        patients: db.patients.filter(p => p.createdAt >= start && p.createdAt < end).length,
-        visits: db.visits.filter(v => v.ts >= start && v.ts < end).length + Math.max(0, 5 - i) * 3,
-      });
-    }
-    const statusDist = REF_FLOW.map(s => ({ status: s, count: db.referrals.filter(r => r.status === s).length })).filter(x => x.count > 0);
-    const workload = db.facilities.filter(f => f.type !== "SUBCENTRE").map(f => ({
-      name: f.name.replace("District Hospital ", "DH ").replace("Rural Hospital ", "RH "),
-      open: active.filter(r => r.toFacilityId === f.id).length,
-      completed: completed.filter(r => r.toFacilityId === f.id).length,
-      bedsFree: f.availableBeds, load: f.workload,
-    }));
-    const riskByFacility = db.facilities.filter(f => f.type !== "SUBCENTRE").map(f => {
-      const workers = db.users.filter(x => x.facilityId === f.id).map(x => x.id);
-      const count = db.assessments.filter(a => workers.includes(a.workerId) || a.level === "CRITICAL" && f.id === "F-CHC-01").length;
-      return { name: f.name.replace("District Hospital ", "DH ").replace("Rural Hospital ", "RH "), high: db.assessments.filter(a => workers.includes(a.workerId) && a.level === "HIGH").length, critical: db.assessments.filter(a => workers.includes(a.workerId) && a.level === "CRITICAL").length, count };
-    });
-    const procTimes = completed.filter(r => r.completedAt).map(r => (r.completedAt! - r.ts) / 3600000);
-    const shortages = db.facilities.flatMap(f => [
+    const [an, bn, refsRaw] = await Promise.all([
+      rq<AnyObj>("GET", "/admin/analytics"),
+      rq<AnyObj[]>("GET", "/admin/bottlenecks"),
+      rq<AnyObj>("GET", "/referrals?limit=500"),
+    ]);
+    const refs = (refsRaw.items ?? []) as AnyObj[];
+    if (!cache.facilities.length) await loadFacilities().catch(() => undefined);
+
+    const short = (n: string) => n.replace("District Hospital", "DH").replace("Primary Health Centre", "PHC")
+      .replace("Community Health Centre", "CHC").replace("Rural Hospital", "RH");
+    const activeOf = (fid: string) => refs.filter(r => r.to_facility_id === fid && r.status !== "COMPLETED" && r.status !== "CANCELLED");
+    const shortages = cache.facilities.flatMap(f => [
       ...f.medicines.filter(m => m.status !== "AVAILABLE").map(m => ({ facility: f.name, item: m.name, type: "Medicine", status: m.status })),
       ...f.diagnostics.filter(m => m.status !== "AVAILABLE").map(m => ({ facility: f.name, item: m.name, type: "Diagnostic", status: m.status })),
     ]);
+    const weeks = (an.patients_by_month ?? []).map((m: AnyObj) => ({ label: m.month, patients: m.patients, visits: 0 }));
+    const statusDist = Object.entries(an.referral_status_distribution ?? {}).map(([status, count]) => ({ status, count: count as number }));
+    const workload = (an.facility_workload ?? []).map((w: AnyObj) => ({
+      name: short(w.name), open: w.active_referrals ?? 0,
+      completed: refs.filter(r => r.to_facility_id === w.facility_id && r.status === "COMPLETED").length,
+      bedsFree: w.available_beds ?? 0, load: w.workload_level ?? "MODERATE",
+    }));
+    const riskByFacility = (an.high_risk_by_facility ?? []).map((x: AnyObj) => ({
+      name: short(facilityName(x.facility_id)), high: x.high ?? 0, critical: x.critical ?? 0,
+      count: x.high_risk_cases ?? 0,
+    }));
+    const bottlenecks = bn.map(b => ({
+      facility: cache.facilities.find(f => f.id === b.facility_id) ?? {
+        id: b.facility_id, name: b.name, type: "PHC" as const, village: "", distanceKm: 0, phone: "",
+        totalBeds: 0, availableBeds: 0, icuBeds: 0, icuAvailable: 0, emergency: false,
+        oxygen: "UNAVAILABLE" as Availability, criticalCare: "UNAVAILABLE" as Availability,
+        diagnostics: [], medicines: [], specialists: [], workload: "MODERATE" as const, mapX: 50, mapY: 50,
+      },
+      created: b.total, completed: b.completed, pending: b.pending, overdue: b.overdue,
+      inFlow: activeOf(b.facility_id).length,
+    }));
     return {
       totals: {
-        patients: db.patients.length, activeReferrals: active.length,
-        pending: active.filter(r => ["SENT", "ACKNOWLEDGED", "ACCEPTED"].includes(r.status)).length,
-        overdue: active.filter(isOverdue).length,
-        highRisk, critical, completed: completed.length, missedFollowups: missed,
-        facilities: db.facilities.length, shortages: shortages.length,
-        completionRate: Math.round((completed.length / Math.max(1, completed.length + active.length)) * 100),
-        avgHours: Math.round(procTimes.reduce((a, b) => a + b, 0) / Math.max(1, procTimes.length)),
+        patients: an.total_patients, activeReferrals: an.active_referrals, pending: an.pending_referrals,
+        overdue: an.overdue_referrals, highRisk: an.high_risk_cases, critical: an.critical_cases,
+        completed: an.completed_referrals, missedFollowups: an.missed_followups, facilities: an.facilities,
+        shortages: an.resource_shortages, completionRate: Math.round((an.completion_rate ?? 0) * 100),
+        avgHours: an.avg_completion_hours ?? 0,
       },
-      weeks, statusDist, workload, riskByFacility, shortages,
-      bottlenecks: db.facilities.filter(f => f.type === "PHC" || f.type === "CHC").map(f => ({
-        facility: f, created: db.referrals.filter(r => r.fromFacilityId === f.id).length,
-        completed: db.referrals.filter(r => r.fromFacilityId === f.id && r.status === "COMPLETED").length,
-        pending: db.referrals.filter(r => r.fromFacilityId === f.id && !["COMPLETED", "CANCELLED"].includes(r.status)).length,
-        overdue: db.referrals.filter(r => r.fromFacilityId === f.id && isOverdue(r)).length,
-        inFlow: db.referrals.filter(r => r.toFacilityId === f.id && !["COMPLETED", "CANCELLED"].includes(r.status)).length,
-      })),
+      weeks, statusDist, workload, riskByFacility, shortages, bottlenecks,
     };
   },
 
   async listAudit(user: User | null) {
-    await wait();
     const u = requireUser(user);
     requirePerm(u, "audit.read");
-    return [...getDB().audit];
+    const rows = await rq<AnyObj[]>("GET", "/admin/audit-logs?limit=300");
+    return rows.map(mapAudit);
   },
 
-  /* ---- sync */
+  /* ---- sync (POST /sync/batch — idempotent by client operation id) */
   async syncState() {
-    const db = getDB();
-    return {
-      ops: [...db.sync].sort((a, b) => b.ts - a.ts),
-      pending: db.sync.filter(o => o.status === "PENDING").length,
-      failed: db.sync.filter(o => o.status === "FAILED").length,
-      synced: db.syncBaseline.synced + db.sync.filter(o => o.status === "SYNCED").length,
-      lastSyncAt: db.lastSyncAt,
-    };
+    return buildSyncState();
   },
 
   async syncNow(user: User | null) {
-    const u = requireUser(user);
+    requireUser(user);
     if (offlineProbe()) throw new ApiError(503, "Cannot sync while offline.");
-    await wait(1400);
-    const db = getDB();
-    const drained = db.sync.filter(o => o.status !== "SYNCED");
-    drained.forEach(o => { o.status = "SYNCED"; o.attempts += 1; o.error = undefined; });
-    db.lastSyncAt = Date.now();
-    syncBridge.drain?.(drained.map(o => o.id));
-    audit(u.id, u.name, u.role, "SYNC_BATCH", "sync", { details: `${drained.length} operations synchronized to central server` });
+    const queued = (await syncOpsAll()).filter(o => o.status !== "SYNCED");
+    if (queued.length === 0) {
+      cache.lastSyncAt = Date.now();
+      save();
+      return buildSyncState();
+    }
+    const res = await rq<{ applied: number; conflicts: number; duplicates: number; results: AnyObj[] }>(
+      "POST", "/sync/batch", {
+        body: {
+          ops: queued.map(o => ({
+            id: o.id, entity: o.entity, operation: o.operation ?? "create",
+            payload: o.payload ?? {}, client_ts: new Date(o.ts).toISOString(),
+          })),
+        },
+      });
+    for (const r of res.results) {
+      const local = cache.sync.find(o => o.id === r.id);
+      if (r.status === "APPLIED") {
+        if (local) { local.status = "SYNCED"; local.attempts += 1; local.error = undefined; }
+        await syncOpsRemove(r.id);
+      } else if (r.status === "CONFLICT") {
+        const err = (r.result?.error as string) ?? "Server reported a conflict — review before retrying.";
+        if (local) { local.status = "FAILED"; local.attempts += 1; local.error = err; }
+        await syncOpsPut({ ...queued.find(o => o.id === r.id)!, status: "FAILED", error: err });
+      }
+    }
+    cache.lastSyncAt = Date.now();
+    cache.syncBaseline.synced += res.applied;
     save();
-    return this.syncState();
+    return buildSyncState();
   },
 };
 
-/* ------------------------------------------------- AI record summary (deterministic) */
+/* ------------------------------------- AI record summary (deterministic) */
 
 export function buildAiSummary(db: DB, patientId: string): string[] {
   const p = db.patients.find(x => x.id === patientId);
@@ -836,7 +1161,7 @@ export function buildAiSummary(db: DB, patientId: string): string[] {
   return lines;
 }
 
-/* ------------------------------------------------- FHIR adapter (integration-ready) */
+/* ------------------------------------- FHIR adapter (integration-ready) */
 
 export function toFhirBundle(db: DB, patientId: string) {
   const p = db.patients.find(x => x.id === patientId);
@@ -845,7 +1170,7 @@ export function toFhirBundle(db: DB, patientId: string) {
     resource: {
       resourceType: "Patient", id: p.rakId,
       identifier: [{ system: "urn:raksha:patient-id", value: p.rakId }, { system: "urn:abha:id", value: p.abhaId ?? "not-linked" }],
-      name: [{ text: p.name }], gender: p.gender.toLowerCase(), birthDate: p.dob,
+      name: [{ text: p.name }], gender: p.gender.toLowerCase(), birthDate: p.dob || undefined,
       address: [{ city: p.village, text: p.address }],
     },
   }];
@@ -862,5 +1187,3 @@ export function toFhirBundle(db: DB, patientId: string) {
   db.diagnostics.filter(x => x.patientId === patientId).forEach(dg => entry.push({ resource: { resourceType: "DiagnosticReport", status: dg.status === "COMPLETED" ? "final" : "preliminary", code: { text: dg.test }, conclusion: dg.result } }));
   return { resourceType: "Bundle", type: "collection", timestamp: new Date().toISOString(), total: entry.length, entry };
 }
-
-export { SESSION_KEY };

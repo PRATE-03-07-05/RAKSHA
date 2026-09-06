@@ -30,6 +30,15 @@ _APPT_TRANSITIONS = {
 }
 
 
+def _tout(db: Session, t: Teleconsultation) -> TeleOut:
+    """TeleOut with the consulting clinician's name + specialty resolved."""
+    out = TeleOut.model_validate(t)
+    doctor = db.get(User, t.doctor_id) if t.doctor_id else None
+    out.doctor_name = doctor.name if doctor else None
+    out.specialty = doctor.specialty if doctor else None
+    return out
+
+
 def _own_patient(user: User, db: Session, patient_id: str) -> Patient:
     p = db.get(Patient, patient_id)
     if p is None:
@@ -124,7 +133,7 @@ def create_tele(body: TeleCreate, user: CurrentUser, db: DB):
     db.add(t)
     db.commit()
     db.refresh(t)
-    return t
+    return _tout(db, t)
 
 
 @router.get("/teleconsultations", response_model=list[TeleOut], summary="List teleconsultations (role scoped)")
@@ -135,7 +144,7 @@ def list_teles(user: CurrentUser, db: DB):
         q = q.where(Teleconsultation.patient_id.in_(own))
     elif user.role in CLINICAL:
         q = q.where(Teleconsultation.doctor_id == user.id)
-    return [TeleOut.model_validate(t) for t in db.execute(q).scalars()]
+    return [_tout(db, t) for t in db.execute(q).scalars()]
 
 
 @router.patch("/teleconsultations/{tele_id}/complete", response_model=TeleOut,
@@ -160,4 +169,4 @@ def complete_tele(tele_id: str, body: TeleComplete, user: CurrentUser, db: DB):
     log_action(db, user, AuditAction.TELECONSULT_COMPLETE, "teleconsultation", t.id, patient_id=t.patient_id)
     db.commit()
     db.refresh(t)
-    return t
+    return _tout(db, t)

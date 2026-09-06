@@ -122,6 +122,8 @@ export interface Facility {
   specialists: { specialty: string; name: string; available: boolean }[];
   workload: "LOW" | "MODERATE" | "HIGH";
   mapX: number; mapY: number;
+  /** Raw coordinates from the backend (demo data) — used for distance math. */
+  mapLat?: number; mapLng?: number;
 }
 
 export interface AuditLog {
@@ -132,6 +134,9 @@ export interface AuditLog {
 export interface SyncOp {
   id: string; ts: number; entity: string; label: string;
   status: "PENDING" | "SYNCED" | "FAILED"; attempts: number; error?: string;
+  /** Sync-batch fields (mirrors backend SyncOpIn) — set for queueable ops. */
+  operation?: "create" | "update";
+  payload?: Record<string, unknown>;
 }
 
 export interface DB {
