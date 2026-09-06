@@ -5,12 +5,16 @@ contributing factors. This is decision support for healthcare workers —
 it never claims a diagnosis. Thresholds are configurable via environment
 (see app/config.py) so rules live in exactly one place.
 """
+import logging
+
 from sqlalchemy.orm import Session
 
 from ..audit import AuditAction, log_action
 from ..config import get_settings
 from ..models import Assessment, RiskLevel, User
 from ..schemas import TriageFactor, TriageRequest, TriageResponse
+
+log = logging.getLogger("raksha.triage")
 
 _CHRONIC = {"diabetes", "hypertension", "asthma", "copd", "tuberculosis", "tb", "cardiac", "heart"}
 
@@ -128,6 +132,62 @@ def assess(req: TriageRequest) -> TriageResponse:
         contributing_factors=factors,
         rule_version=s.triage_rule_version,
     )
+
+
+def _ml_to_response(ml) -> TriageResponse:
+    """Adapt an ``ml.inference.MLResult`` into the shared TriageResponse."""
+    level = RiskLevel(ml.risk_level)
+    factors = []
+    for feat in ml.contributing_features:
+        rel = feat.get("relative_weight", 0.0)
+        severity = "high" if rel >= 0.3 else ("warn" if rel >= 0.15 else "info")
+        value = feat.get("value")
+        value_txt = "not recorded" if value is None else str(value)
+        factors.append(TriageFactor(
+            code=feat["feature"].upper(),
+            label=f"{feat['label']}: {value_txt}",
+            weight=int(round(rel * 100)),
+        ))
+    return TriageResponse(
+        risk_level=level.value,
+        score=int(round(ml.confidence * 100)),
+        recommended_action=ACTION_BY_LEVEL[level],
+        red_flags=ml.red_flags,
+        contributing_factors=factors,
+        rule_version=f"ml-{ml.model_name}@{ml.model_version}",
+        mode="ML_MODEL",
+        confidence=ml.confidence,
+        model_version=ml.model_version,
+    )
+
+
+def assess_with_fallback(req: TriageRequest) -> TriageResponse:
+    """ML-first decision support with a transparent rule-based fallback.
+
+    If a trained model is persisted it is used (``mode=ML_MODEL``). If the
+    model or its dependencies are unavailable — or anything at all goes wrong
+    during inference — the deterministic rule engine serves the request and the
+    response is clearly labelled ``mode=RULE_BASED_FALLBACK``. The app never
+    crashes and never silently pretends a rule result came from the model.
+    """
+    try:
+        from ml.inference import is_ml_available, predict_record  # noqa: PLC0415
+        from ml.preprocessing import request_to_record  # noqa: PLC0415
+
+        if is_ml_available():
+            record = request_to_record(req)
+            result = predict_record(record)
+            log.info("triage served by ML model (%s): %s", result.model_version, result.risk_level)
+            return _ml_to_response(result)
+        log.info("triage: ML model unavailable — using rule-based fallback")
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully, never crash
+        log.warning("triage: ML inference failed (%s) — using rule-based fallback", exc)
+
+    result = assess(req)
+    result.mode = "RULE_BASED_FALLBACK"
+    result.confidence = None
+    result.model_version = None
+    return result
 
 
 def persist(db: Session, actor: User, req: TriageRequest, result: TriageResponse,

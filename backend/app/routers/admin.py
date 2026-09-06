@@ -1,17 +1,20 @@
-"""District administration: analytics, bottleneck visibility, audit logs."""
+"""District administration: analytics, bottleneck visibility, audit logs and
+real, database-driven user management."""
 from datetime import date, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..audit import AuditAction, log_action
 from ..database import get_db
-from ..models import (Assessment, AuditLog, Facility, FacilityResource,
-                      FollowUp, FollowUpStatus, Patient, Referral,
-                      ReferralStatus, Role)
-from ..schemas import AnalyticsOut, AuditOut
-from ..security import CurrentUser, require_roles
+from ..models import (Assessment, AuditLog, EmergencyEvent, EmergencyStatus,
+                      Facility, FacilityResource, FollowUp, FollowUpStatus,
+                      Patient, Referral, ReferralStatus, Role, User)
+from ..schemas import (AnalyticsOut, AuditOut, PasswordReset, UserCreate,
+                       UserOut, UserUpdate)
+from ..security import CurrentUser, hash_password, require_roles
 from ..services.referrals import is_overdue
 
 router = APIRouter(prefix="/admin", tags=["admin"],
@@ -27,6 +30,9 @@ def analytics(_: CurrentUser, db: DB):
     patients = db.execute(select(Patient)).scalars().all()
     referrals = db.execute(select(Referral)).scalars().all()
     facilities = db.execute(select(Facility).where(Facility.is_active.is_(True))).scalars().all()
+    total_users = len(db.execute(select(User)).scalars().all())
+    active_emergencies = len(db.execute(select(EmergencyEvent)
+                                        .where(EmergencyEvent.status == EmergencyStatus.ACTIVE)).scalars().all())
 
     completed = [r for r in referrals if r.status == ReferralStatus.COMPLETED]
     active = [r for r in referrals if r.status in ACTIVE_STATES]
@@ -88,6 +94,8 @@ def analytics(_: CurrentUser, db: DB):
 
     return AnalyticsOut(
         total_patients=len(patients),
+        total_users=total_users,
+        active_emergencies=active_emergencies,
         total_referrals=len(referrals),
         active_referrals=len(active),
         pending_referrals=len(pending),
@@ -135,3 +143,87 @@ def audit_logs(_: CurrentUser, db: DB,
     if action:
         q = q.where(AuditLog.action == action.upper())
     return [AuditOut.model_validate(a) for a in db.execute(q.limit(limit)).scalars()]
+
+
+# ------------------------------------------------------------- user management
+# Real, database-driven user administration. Passwords are always stored as
+# bcrypt hashes — plaintext never leaves the request boundary.
+
+@router.get("/users", response_model=list[UserOut], summary="List users (admin only)")
+def list_users(_: CurrentUser, db: DB,
+               role: str | None = Query(None),
+               limit: int = Query(200, ge=1, le=500),
+               offset: int = Query(0, ge=0)):
+    q = select(User).order_by(User.created_at.desc())
+    if role:
+        q = q.where(User.role == Role(role.upper()))
+    rows = db.execute(q.limit(limit).offset(offset)).scalars().all()
+    return [UserOut.model_validate(u) for u in rows]
+
+
+@router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED,
+             summary="Create a user (admin only)")
+def create_user(body: UserCreate, admin: CurrentUser, db: DB):
+    existing = db.execute(select(User).where(User.email == body.email.lower())).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A user with this email already exists")
+    if body.facility_id and db.get(Facility, body.facility_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Facility not found")
+
+    u = User(
+        email=body.email.lower(),
+        name=body.name,
+        phone=body.phone,
+        password_hash=hash_password(body.password),
+        role=body.role,
+        specialty=body.specialty,
+        facility_id=body.facility_id,
+        district=body.district,
+        village=body.village,
+        is_active=True,
+    )
+    db.add(u)
+    db.flush()
+    log_action(db, admin, AuditAction.USER_CREATE, "user", u.id,
+               detail={"email": u.email, "role": u.role.value})
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+@router.patch("/users/{user_id}", response_model=UserOut,
+              summary="Update user role / facility / activation (admin only)")
+def update_user(user_id: str, body: UserUpdate, admin: CurrentUser, db: DB):
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if u.id == admin.id and body.is_active is False:
+        raise HTTPException(status.HTTP_409_CONFLICT, "You cannot deactivate your own account")
+    if body.facility_id and db.get(Facility, body.facility_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Facility not found")
+
+    changes: dict[str, object] = {}
+    for field in ("name", "role", "facility_id", "district", "phone", "specialty", "village", "is_active"):
+        value = getattr(body, field)
+        if value is not None:
+            changes[field] = value
+            setattr(u, field, value)
+    if changes:
+        log_action(db, admin, AuditAction.USER_UPDATE, "user", u.id,
+                   detail={"fields": sorted(str(k) for k in changes)})
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+@router.post("/users/{user_id}/reset-password", response_model=UserOut,
+             summary="Reset a user's password (admin only)")
+def reset_user_password(user_id: str, body: PasswordReset, admin: CurrentUser, db: DB):
+    u = db.get(User, user_id)
+    if u is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    u.password_hash = hash_password(body.new_password)
+    log_action(db, admin, AuditAction.USER_RESET_PASSWORD, "user", u.id)
+    db.commit()
+    db.refresh(u)
+    return u

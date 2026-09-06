@@ -49,5 +49,18 @@ echo "[boot] Running Alembic migrations: alembic upgrade head"
 alembic upgrade head
 echo "[boot] Migrations complete. Seeding demo data: python seed.py"
 python seed.py
-echo "[boot] Seed complete. Starting Uvicorn on 0.0.0.0:8000"
+echo "[boot] Seed complete."
+
+# First-run ML triage model training (only if no artifact is present). The
+# synthetic, clearly-labelled dev dataset is used. A failure here never blocks
+# startup — the API transparently falls back to the rule-based engine.
+if [ ! -f ml/models/triage_model.joblib ]; then
+  echo "[boot] No ML triage model found — training on the synthetic set (first run only)..."
+  python -m ml.training.train --synthetic \
+    || echo "[boot] WARNING: ML training failed — the rule-based fallback will serve triage."
+else
+  echo "[boot] ML triage model already present — skipping training."
+fi
+
+echo "[boot] Starting Uvicorn on 0.0.0.0:8000"
 exec uvicorn app.main:app --host 0.0.0.0 --port 8000

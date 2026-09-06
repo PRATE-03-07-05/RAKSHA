@@ -21,15 +21,31 @@ ASSESSORS = (*FIELD_WORKERS, *CLINICAL)
 
 
 @router.post("/assess", response_model=TriageResponse,
-             summary="Rule-based preliminary risk assessment (decision support)",
+             summary="ML-based preliminary risk assessment (decision support)",
+             description="Uses the trained triage model when available "
+                         "(mode=ML_MODEL) and transparently falls back to the "
+                         "rule engine otherwise (mode=RULE_BASED_FALLBACK). "
+                         "Decision support only — never a diagnosis.",
              dependencies=[Depends(require_roles(*ASSESSORS))])
 def assess(body: TriageRequest, user: CurrentUser, db: DB):
-    result = svc.assess(body)
+    result = svc.assess_with_fallback(body)
     if body.patient_id:
         a = svc.persist(db, user, body, result)
         db.commit()
         result.assessment_id = a.id
     return result
+
+
+@router.get("/model", summary="Decision-support engine status (ML vs rule fallback)")
+def model_status(_: CurrentUser):
+    from ml.inference import is_ml_available, model_info  # noqa: PLC0415
+
+    if is_ml_available():
+        info = model_info() or {}
+        return {"mode": "ML_MODEL", "available": True, **info}
+    return {"mode": "RULE_BASED_FALLBACK", "available": False,
+            "note": "No trained artifact found — the transparent rule engine is serving "
+                    "assessments. Train one with `python -m ml.training.train`."}
 
 
 @router.post("/respiratory-risk", response_model=TriageResponse,

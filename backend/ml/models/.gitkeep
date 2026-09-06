@@ -1,0 +1,3 @@
+# This directory holds persisted ML artifacts (triage_model.joblib, metrics).
+# Artifacts are gitignored (they are large and regenerable); this file keeps
+# the directory present so the training/inference code has a stable target.
