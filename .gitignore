@@ -1,5 +1,35 @@
+# --- Frontend ---
 node_modules/
 .next/
 dist/
 build/
 *.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- Environment & secrets (never commit) ---
+.env
+backend/.env
+*.pem
+*.key
+
+# --- ML artifacts (large + regenerable; train with `python -m ml.training.train`) ---
+backend/ml/models/*.joblib
+backend/ml/models/*.pkl
+backend/ml/models/model_metrics.json
+backend/ml/models/classification_report.txt
+backend/ml/models/confusion_matrix.json
+
+# --- Datasets (synthetic sets are regenerable; never commit real patient data) ---
+backend/ml/data/*.csv
+backend/ml/data/*.meta.json
+
+# --- Docker volumes ---
+pgdata/

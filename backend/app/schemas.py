@@ -9,7 +9,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from .models import Gender
+from .models import Gender, Role
 
 T = TypeVar("T")
 
@@ -48,6 +48,34 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+
+
+class UserCreate(BaseModel):
+    """Admin-driven user provisioning. Passwords are hashed server-side."""
+    email: EmailStr
+    name: str = Field(min_length=2, max_length=120)
+    password: str = Field(min_length=8, max_length=128)
+    role: Role
+    facility_id: str | None = None
+    district: str | None = None
+    phone: str | None = Field(default=None, max_length=20)
+    specialty: str | None = None
+    village: str | None = None
+
+
+class UserUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    role: Role | None = None
+    facility_id: str | None = None
+    district: str | None = None
+    phone: str | None = None
+    specialty: str | None = None
+    village: str | None = None
+    is_active: bool | None = None
+
+
+class PasswordReset(BaseModel):
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 # ------------------------------------------------------------------- patients
@@ -557,6 +585,8 @@ class SyncStatusOut(BaseModel):
 
 class AnalyticsOut(BaseModel):
     total_patients: int
+    total_users: int
+    active_emergencies: int
     total_referrals: int
     active_referrals: int
     pending_referrals: int
@@ -622,6 +652,10 @@ class TriageResponse(BaseModel):
     red_flags: list[str]
     contributing_factors: list[TriageFactor]
     rule_version: str
+    # ML pipeline metadata — null fields indicate the rule-based fallback mode.
+    mode: str | None = None                    # "ML_MODEL" | "RULE_BASED_FALLBACK"
+    confidence: float | None = None            # P(predicted class), when a model ran
+    model_version: str | None = None
     disclaimer: str = ("AI-assisted preliminary assessment — not a medical diagnosis. "
                        "A qualified clinician makes the final decision.")
     assessment_id: str | None = None           # set when persisted for a patient
