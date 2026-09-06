@@ -186,6 +186,9 @@ def main() -> None:
                                         "district hospital escalation advised.",
                           status="ACTIVE", sms_token="RK4X92", sms_expires_at=d(0, 3),
                           created_at=d(0, -18)))
+    # Persist the longitudinal-record events (including the c-sita-1
+    # consultation + its prescription) before anything references them.
+    db.flush()
 
     # -------------------------------------------------------------- referrals
     def ref_events(rid, steps, facility):
@@ -230,6 +233,9 @@ def main() -> None:
         ("IN_CONSULTATION", "TREATMENT", "u-chcdr", "CHC_DOCTOR", d(-25, 4), "Treatment"),
         ("TREATMENT", "COMPLETED", "u-chcdr", "CHC_DOCTOR", d(-25, 6), "Outcome: treated and discharged"),
     ], "F-CHC-01")
+    # r-sita-1 / r-sita-0 (and their event histories) must physically exist
+    # before f-sita-1 references r-sita-0 — enforce the FK order explicitly.
+    db.flush()
     db.add(FollowUp(id="f-sita-1", patient_id="p-sita", referral_id="r-sita-0",
                     scheduled_date=date.today() + timedelta(days=6),
                     notes="Check BP at home; ensure medication adherence", assignee_role="ASHA"))
@@ -271,6 +277,9 @@ def main() -> None:
         ("IN_CONSULTATION", "TREATMENT", "u-specialist", "SPECIALIST", d(-4, 4), "Treatment"),
         ("TREATMENT", "COMPLETED", "u-specialist", "SPECIALIST", d(-4, 5), "Completed"),
     ], "F-DH-01")
+    # r-ramesh / r-arjun / r-kavita must exist before f-ramesh-over references
+    # r-ramesh — same explicit FK ordering as above.
+    db.flush()
 
     db.add(FollowUp(id="f-ramesh-over", patient_id="p-02", referral_id="r-ramesh",
                     scheduled_date=date.today() - timedelta(days=2),
@@ -295,7 +304,7 @@ def main() -> None:
                      ref_kind="referral", ref_id="r-sita-1", link="/app/referrals/r-sita-1", delivered=True),
         Notification(user_id="u-asha", patient_id="p-sita", kind=NotificationKind.info,
                      channel=NotificationChannel.IN_APP, title="Follow-up due — Sita Devi",
-                     body=f"BP review due {date.today() + timedelta(days=6).isoformat()}.",
+                     body=f"BP review due {(date.today() + timedelta(days=6)).isoformat()}.",
                      ref_kind="followup", ref_id="f-sita-1", link="/app/followups", delivered=True),
         Notification(user_id="u-patient", kind=NotificationKind.info,
                      channel=NotificationChannel.IN_APP, title="Appointment booked",
