@@ -81,7 +81,7 @@ def create_patient(body: PatientCreate, user: CurrentUser, db: DB):
                detail={"rak_id": p.rak_id, "village": p.village})
     db.commit()
     db.refresh(p)
-    return p
+    return PatientOut.model_validate(p)
 
 
 @router.get("/{patient_id}", response_model=PatientOut, summary="Patient profile (consent + RBAC enforced)")
@@ -92,7 +92,8 @@ def get_patient(patient_id: str, request: Request, user: CurrentUser, db: DB):
                detail={"purpose": request.headers.get("X-Access-Purpose", "care delivery")},
                ip=request.client.host if request.client else None)
     db.commit()
-    return p
+    db.refresh(p)
+    return PatientOut.model_validate(p)
 
 
 @router.patch("/{patient_id}", response_model=PatientOut, summary="Update patient (optimistic versioning)")
@@ -118,12 +119,12 @@ def update_patient(patient_id: str, body: PatientUpdate, user: CurrentUser, db: 
         p.consent_granted = body.consent_granted
         p.consent_at = datetime.now(timezone.utc) if body.consent_granted else None
         changes["consent_granted"] = body.consent_granted
-    p.version += 1
+    p.version += 1  # exactly one increment per accepted update
     log_action(db, user, AuditAction.PATIENT_UPDATE, "patient", p.id, patient_id=p.id,
                detail={"fields": sorted(changes.keys()), "version": p.version})
     db.commit()
     db.refresh(p)
-    return p
+    return PatientOut.model_validate(p)
 
 
 @router.get("/{patient_id}/timeline", response_model=list[TimelineEvent],

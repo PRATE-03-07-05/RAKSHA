@@ -2,6 +2,17 @@
 
 The application database remains PostgreSQL (see app/database.py); tests
 simply override the get_db dependency, which is standard FastAPI practice.
+
+Session architecture (mirrors production get_db semantics):
+- Each HTTP request gets its OWN session, closed at request teardown —
+  exactly like the real dependency. This gives requests an independent
+  identity map, so router-side mutations never leak into test-side ORM
+  objects (optimistic-version assertions stay meaningful).
+- The fixture session used by `make_user` / `make_patient` helpers is a
+  separate, long-lived session closed only at test teardown.
+- `expire_on_commit=False` keeps committed fixture objects readable after
+  request commits, preventing DetachedInstanceError-style expiry without
+  ever swallowing real errors.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -19,23 +30,27 @@ engine = create_engine(
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
-TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False,
+                              expire_on_commit=False, future=True)
 
 
 @pytest.fixture(autouse=True)
 def db():
     Base.metadata.create_all(engine)
-    session = TestingSession()
+    session = TestingSession()  # long-lived session for test-side helpers
 
     def _override():
+        # One fresh session per request — production-like transaction scope.
+        request_session = TestingSession()
         try:
-            yield session
+            yield request_session
         finally:
-            session.close()
+            request_session.close()
 
     app.dependency_overrides[get_db] = _override
     yield session
     app.dependency_overrides.clear()
+    session.close()
     Base.metadata.drop_all(engine)
 
 

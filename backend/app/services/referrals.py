@@ -69,9 +69,15 @@ def _authorize(user: User, referral: Referral, target: ReferralStatus) -> None:
         if not (is_creator or at_source or user.role == Role.DISTRICT_ADMIN):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the creator, source facility or admin can cancel")
         return
-    if target in (ReferralStatus.ACKNOWLEDGED, ReferralStatus.ACCEPTED,
-                  ReferralStatus.IN_CONSULTATION, ReferralStatus.TREATMENT,
-                  ReferralStatus.COMPLETED):
+    if target == ReferralStatus.ACKNOWLEDGED:
+        # Acknowledgement is a coordination step: referral-desk staff
+        # (PHC_STAFF) may confirm receipt on behalf of the network, while
+        # clinical roles must belong to the receiving facility.
+        if user.role != Role.PHC_STAFF and not at_destination:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                "Acknowledgement requires the receiving facility or referral-desk staff")
+    elif target in (ReferralStatus.ACCEPTED, ReferralStatus.IN_CONSULTATION,
+                    ReferralStatus.TREATMENT, ReferralStatus.COMPLETED):
         if not at_destination:
             raise HTTPException(status.HTTP_403_FORBIDDEN,
                                 "Only staff of the receiving facility can perform this step")
