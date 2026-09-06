@@ -1,0 +1,57 @@
+# RAKSHA — local development stack
+#   docker compose up db          # PostgreSQL only
+#   docker compose up backend     # FastAPI (auto-runs migrations + seed)
+#   docker compose up --build     # full stack (db + backend + frontend)
+#
+# Inside the backend container:
+#   docker compose exec backend alembic upgrade head   # run migrations
+#   docker compose exec backend python seed.py         # deterministic demo data
+#   docker compose exec backend pytest -q              # automated tests
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: raksha
+      POSTGRES_PASSWORD: raksha
+      POSTGRES_DB: raksha
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raksha -d raksha"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    command: >
+      sh -c "alembic upgrade head && python seed.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://raksha:raksha@db:5432/raksha
+      JWT_SECRET: dev-secret-do-not-use-in-production
+      CORS_ORIGINS: http://localhost:5173,http://localhost:4173,http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: sh -c "npm install && npm run build && npx --yes serve -s dist -l 5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
