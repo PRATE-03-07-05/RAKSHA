@@ -77,6 +77,31 @@ def assess(req: TriageRequest) -> TriageResponse:
     if chronic:
         add("CHRONIC_CONDITIONS", f"Known conditions: {', '.join(chronic)}", min(8 * len(chronic), 16))
 
+    # Explainability guarantee: every assessment states what was observed,
+    # including clean ones. These factors carry weight 0 — they document
+    # the reasoning without changing the score or the risk level.
+    if req.cough and not any(f.code == "PERSISTENT_COUGH" for f in factors):
+        add("COUGH_NO_WARNING", "Cough reported — no prolonged duration or warning signs", 0)
+    normal_checks: list[str] = []
+    if req.spo2 is not None and req.spo2 >= s.triage_spo2_high:
+        normal_checks.append(f"SpO₂ {req.spo2}%")
+    if req.temperature is not None and req.temperature < s.triage_temp_high:
+        normal_checks.append(f"temperature {req.temperature}°C")
+    if req.respiratory_rate is not None and req.respiratory_rate < s.triage_rr_high:
+        normal_checks.append(f"respiratory rate {req.respiratory_rate}/min")
+    if normal_checks and not factors:
+        factors.append(TriageFactor(
+            code="VITALS_WITHIN_RANGE",
+            label="Recorded observations within configured normal ranges: " + ", ".join(normal_checks),
+            weight=0,
+        ))
+    if not factors:
+        factors.append(TriageFactor(
+            code="NO_RISK_SIGNALS",
+            label="No red-flag symptoms or abnormal observations reported",
+            weight=0,
+        ))
+
     # Level from score, then hard escalations for red-flag combinations
     if score >= 60:
         level = RiskLevel.CRITICAL
