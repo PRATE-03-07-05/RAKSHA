@@ -110,11 +110,14 @@ interface SyncCounts { pending: number; synced: number; failed: number; lastSync
 interface ConnShape {
   netOnline: boolean; simOffline: boolean; setSimOffline: (v: boolean) => void;
   offline: boolean; syncing: boolean; counts: SyncCounts; idbCount: number;
+  /** True once the backend /health probe has succeeded (not just navigator.onLine). */
+  serverReachable: boolean;
   syncNow: () => Promise<void>; retryFailed: () => Promise<void>;
 }
 const ConnCtx = createContext<ConnShape>({
   netOnline: true, simOffline: false, setSimOffline: () => {}, offline: false, syncing: false,
   counts: { pending: 0, synced: 0, failed: 0, lastSyncAt: null, ops: [] }, idbCount: 0,
+  serverReachable: true,
   syncNow: async () => {}, retryFailed: async () => {},
 });
 export const useConn = () => useContext(ConnCtx);
@@ -125,6 +128,7 @@ function ConnProvider({ children }: { children: React.ReactNode }) {
   const [syncing, setSyncing] = useState(false);
   const [counts, setCounts] = useState<SyncCounts>({ pending: 0, synced: 0, failed: 0, lastSyncAt: null, ops: [] });
   const [idbCount, setIdbCount] = useState(0);
+  const [serverReachable, setServerReachable] = useState(true);
   const { user } = useAuth();
   const { toast } = useToast();
   const { t } = useI18n();
@@ -189,9 +193,23 @@ function ConnProvider({ children }: { children: React.ReactNode }) {
     prevOffline.current = offline;
   }, [offline, counts.pending, counts.failed, syncNow]);
 
+  // Backend reachability probe — the browser can report "online" while the
+  // RAKSHA server is unreachable; the status indicator must reflect reality.
+  useEffect(() => {
+    let alive = true;
+    const ping = () => {
+      api.health()
+        .then(() => { if (alive) setServerReachable(true); })
+        .catch(() => { if (alive) setServerReachable(false); });
+    };
+    ping();
+    const iv = window.setInterval(ping, 40000);
+    return () => { alive = false; window.clearInterval(iv); };
+  }, []);
+
   const value = useMemo(() => ({
-    netOnline, simOffline, setSimOffline, offline, syncing, counts, idbCount, syncNow, retryFailed,
-  }), [netOnline, simOffline, setSimOffline, offline, syncing, counts, idbCount, syncNow, retryFailed]);
+    netOnline, simOffline, setSimOffline, offline, syncing, counts, idbCount, serverReachable, syncNow, retryFailed,
+  }), [netOnline, simOffline, setSimOffline, offline, syncing, counts, idbCount, serverReachable, syncNow, retryFailed]);
 
   return <ConnCtx.Provider value={value}>{children}</ConnCtx.Provider>;
 }

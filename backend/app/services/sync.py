@@ -23,10 +23,36 @@ from .patients import generate_rak_id
 _CREATORS = {
     "visit": Visit,
     "vital": VitalObservation,
-    "assessment": Assessment,
     "followup": FollowUp,
     "referral": Referral,
 }
+
+
+def _apply_assessment(db: Session, user: User, op, payload: dict[str, Any]) -> dict[str, Any]:
+    """Assessments captured offline are re-evaluated SERVER-SIDE on sync.
+
+    The client queues only the raw inputs; the decision-support engine (ML
+    model or rule fallback — whatever is active) computes the level, factors
+    and recommendation here. Clients never dictate the authoritative result,
+    and no ML output is ever fabricated while offline.
+    """
+    from ..schemas import TriageRequest
+    from .triage import assess_with_fallback, persist
+
+    raw = payload.get("input") or payload.get("input_snapshot") or {}
+    req = TriageRequest(
+        patient_id=payload.get("patient_id"),
+        age=int(raw.get("age") or 0),
+        spo2=raw.get("spo2"), respiratory_rate=raw.get("rr"),
+        temperature=raw.get("temp"), heart_rate=raw.get("hr"),
+        cough=bool(raw.get("cough")), breathing_difficulty=bool(raw.get("breathing_difficulty")),
+        chest_pain=bool(raw.get("chest_pain")), duration_days=raw.get("duration_days"),
+        pregnant=bool(raw.get("pregnant")), conditions=list(raw.get("conditions") or []),
+        severity_reported=raw.get("severity"), symptoms=list(raw.get("symptoms") or []),
+    )
+    result = assess_with_fallback(req)
+    assessment = persist(db, user, req, result)
+    return {"id": assessment.id, "level": result.risk_level, "mode": result.mode}
 
 
 def _apply_one(db: Session, user: User, op) -> dict[str, Any]:
@@ -47,6 +73,9 @@ def _apply_one(db: Session, user: User, op) -> dict[str, Any]:
             db.add(p)
             db.flush()
             return {"id": p.id, "rak_id": p.rak_id}
+
+        if op.entity == "assessment":
+            return _apply_assessment(db, user, op, payload)
 
         model = _CREATORS.get(op.entity)
         if model is None:
@@ -70,7 +99,8 @@ def _apply_one(db: Session, user: User, op) -> dict[str, Any]:
         raise LookupError("patient not found")
     client_version = payload.get("version")
     if client_version is not None and p.version > client_version:
-        return {"conflict": True, "server_version": p.version}
+        return {"conflict": True, "server_version": p.version,
+                "message": "Sync conflict — the server record is newer. Review required; nothing was overwritten."}
     for field in ("name", "phone", "village", "address", "emergency_contact",
                   "emergency_phone", "conditions", "allergies", "pregnant", "consent_granted"):
         if field in payload and payload[field] is not None:
