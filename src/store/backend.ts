@@ -18,7 +18,7 @@
  *    utilities (decision support only — never a diagnosis).
  */
 import { rq, ApiError, getToken, setToken, TOKEN_KEY } from "../lib/http";
-import { syncOpsAll, syncOpsPut, syncOpsRemove } from "../lib/idb";
+import { syncOpsAll, syncOpsPut, syncOpsRemove, cachedPatientsAll, cachedPatientsPutMany, metaSet } from "../lib/idb";
 import { assessRisk } from "../lib/triage";
 import { uid, todayISO, daysUntil } from "../lib/utils";
 import type {
@@ -419,7 +419,13 @@ async function warmCacheFor(user: User): Promise<void> {
       return mapFacility(f, res);
     }));
     const page = await rq<AnyObj>("GET", user.role === "PATIENT" ? "/patients?limit=10" : "/patients?q=&limit=200");
-    mergeMany(cache.patients, (page.items ?? []).map(mapPatient));
+    const mappedPatients = (page.items ?? []).map(mapPatient);
+    mergeMany(cache.patients, mappedPatients);
+    if (user.role !== "PATIENT") {
+      // Offline field cache — only what this role is already permitted to see.
+      void cachedPatientsPutMany(mappedPatients);
+      void metaSet("lastWarmAt", Date.now());
+    }
     if (user.role !== "PATIENT") {
       const asess = await rq<AnyObj[]>("GET", "/triage/assessments/latest").catch(() => [] as AnyObj[]);
       mergeMany(cache.assessments, asess.map(mapAssessment));
@@ -530,6 +536,11 @@ export const api = {
   async searchPatients(user: User | null, q: string) {
     const u = requireUser(user);
     if (offlineProbe()) {
+      // Hydrate the replica from the IndexedDB field cache (survives restarts).
+      if (cache.patients.length === 0) {
+        const cached = await cachedPatientsAll().catch(() => [] as Patient[]);
+        mergeMany(cache.patients, cached as Patient[]);
+      }
       const term = q.trim().toLowerCase();
       return cache.patients.filter(p => !term ||
         p.name.toLowerCase().includes(term) || p.rakId.toLowerCase().includes(term) ||
@@ -631,29 +642,27 @@ export const api = {
     const u = requireUser(user);
     const has = (...keys: string[]) => input.symptoms.some(s => keys.some(k => s.toLowerCase().includes(k)));
     if (offlineProbe()) {
-      // Same deterministic rules run locally; queued for the server as an assessment event.
+      // OFFLINE HONESTY: the ML model runs server-side, so no ML result is
+      // produced here. We show a clearly-labelled provisional read from the
+      // transparent local rule engine and queue ONLY the raw inputs — the
+      // server re-evaluates with the active decision-support engine on sync.
       const result = assessRisk(input);
-      const weights: Record<TriageFactor["severity"], number> = { critical: 50, high: 25, warn: 15, info: 5 };
-      const factors = result.factors.map(f => ({ code: f.detail || "FACTOR", label: f.label, weight: weights[f.severity] }));
       const a: Assessment = {
         id: uid("as"), patientId, workerId: u.id, workerName: u.name, role: u.role, ts: Date.now(),
         inputs: { ...input }, level: result.level, factors: result.factors,
-        recommendation: result.recommendation, version: result.version, confirmed: false,
+        recommendation: result.recommendation, version: "offline — pending server assessment",
+        confirmed: false, mode: "OFFLINE_PROVISIONAL", pendingSync: true,
       };
       upsert(cache.assessments, a);
       queue("assessment", "create", {
-        id: a.id, patient_id: patientId, level: result.level,
-        score: factors.reduce((s, f) => s + f.weight, 0), factors,
-        red_flags: result.factors.filter(f => f.severity === "critical" || f.severity === "high").map(f => f.label),
-        recommendation: result.recommendation, rule_version: result.version,
-        input_snapshot: {
-          age: input.age, spo2: input.spo2, temperature: input.temp, heart_rate: input.hr,
-          respiratory_rate: input.rr, cough: has("cough"), breathing_difficulty: has("breath"),
-          chest_pain: has("chest"), pregnant: !!input.pregnant, conditions: input.conditions,
-          severity_reported: input.severity, symptoms: input.symptoms,
+        id: a.id, patient_id: patientId,
+        input: {
+          age: input.age, spo2: input.spo2, temp: input.temp, hr: input.hr, rr: input.rr,
+          cough: has("cough"), breathing_difficulty: has("breath"), chest_pain: has("chest"),
+          pregnant: !!input.pregnant, conditions: input.conditions,
+          severity: input.severity, symptoms: input.symptoms,
         },
-        confirmed: false,
-      }, `Triage (${result.level}) — ${patientName(patientId)}`);
+      }, `Triage inputs — ${patientName(patientId)} (server will assess)`);
       return a;
     }
     const res = await rq<AnyObj>("POST", "/triage/assess", {
@@ -670,6 +679,7 @@ export const api = {
       ts: Date.now(), inputs: { ...input }, level: res.risk_level,
       factors: (res.contributing_factors ?? []).map(mapFactor),
       recommendation: res.recommended_action, version: res.rule_version, confirmed: false,
+      mode: res.mode ?? undefined, confidence: res.confidence ?? undefined,
     };
     upsert(cache.assessments, a);
     recordSynced("triage", `Triage (${a.level}) — ${patientName(patientId)}`);
@@ -717,6 +727,7 @@ export const api = {
         createdBy: u.id, createdByName: u.name, creatorRole: u.role, ts: now,
         reason: data.reason, priority: data.priority, clinicalSummary: data.clinicalSummary,
         vitalsSnapshot: data.vitalsSnapshot, expectedDate: data.expectedDate, status: "SENT",
+        pendingSync: true, // NOT delivered until the sync batch is confirmed by the server
         events: [
           { id: uid("rev"), ts: now, actorId: u.id, actorName: u.name, role: u.role, from: null, to: "CREATED", facilityId: data.fromFacilityId },
           { id: uid("rev"), ts: now + 1, actorId: u.id, actorName: u.name, role: u.role, from: "CREATED", to: "SENT", facilityId: data.fromFacilityId, notes: "Queued offline — dispatches on sync" },
@@ -1096,28 +1107,43 @@ export const api = {
       save();
       return buildSyncState();
     }
-    const res = await rq<{ applied: number; conflicts: number; duplicates: number; results: AnyObj[] }>(
-      "POST", "/sync/batch", {
-        body: {
-          ops: queued.map(o => ({
-            id: o.id, entity: o.entity, operation: o.operation ?? "create",
-            payload: o.payload ?? {}, client_ts: new Date(o.ts).toISOString(),
-          })),
-        },
-      });
-    for (const r of res.results) {
-      const local = cache.sync.find(o => o.id === r.id);
-      if (r.status === "APPLIED") {
-        if (local) { local.status = "SYNCED"; local.attempts += 1; local.error = undefined; }
-        await syncOpsRemove(r.id);
-      } else if (r.status === "CONFLICT") {
-        const err = (r.result?.error as string) ?? "Server reported a conflict — review before retrying.";
-        if (local) { local.status = "FAILED"; local.attempts += 1; local.error = err; }
-        await syncOpsPut({ ...queued.find(o => o.id === r.id)!, status: "FAILED", error: err });
+    const MAX_ATTEMPTS = 5;
+    const sendable = queued.filter(o => (o.attempts ?? 0) < MAX_ATTEMPTS);
+    // Ops past the retry limit stay FAILED (never deleted) until a human reviews them.
+    for (const o of queued) {
+      if ((o.attempts ?? 0) >= MAX_ATTEMPTS) {
+        const err = "Retry limit reached — review required. The operation was NOT discarded.";
+        const local = cache.sync.find(x => x.id === o.id);
+        if (local) { local.status = "FAILED"; local.error = err; }
+        await syncOpsPut({ ...o, status: "FAILED", error: err });
       }
     }
+    if (sendable.length > 0) {
+      const res = await rq<{ applied: number; conflicts: number; duplicates: number; results: AnyObj[] }>(
+        "POST", "/sync/batch", {
+          body: {
+            ops: sendable.map(o => ({
+              id: o.id, entity: o.entity, operation: o.operation ?? "create",
+              payload: o.payload ?? {}, client_ts: new Date(o.ts).toISOString(),
+            })),
+          },
+        });
+      for (const r of res.results) {
+        const local = cache.sync.find(o => o.id === r.id);
+        if (r.status === "APPLIED") {
+          // Only a CONFIRMED server success removes the op from the queue.
+          if (local) { local.status = "SYNCED"; local.attempts += 1; local.error = undefined; }
+          await syncOpsRemove(r.id);
+        } else if (r.status === "CONFLICT") {
+          const err = (r.result?.message as string) ?? (r.result?.error as string)
+            ?? "Sync conflict — review required. Server data was not overwritten.";
+          if (local) { local.status = "FAILED"; local.attempts += 1; local.error = err; }
+          await syncOpsPut({ ...queued.find(o => o.id === r.id)!, status: "FAILED", attempts: (local?.attempts ?? 0) + 1, error: err });
+        }
+      }
+      cache.syncBaseline.synced += res.applied;
+    }
     cache.lastSyncAt = Date.now();
-    cache.syncBaseline.synced += res.applied;
     save();
     return buildSyncState();
   },

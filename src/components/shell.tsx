@@ -5,6 +5,7 @@ import {
   Menu, X, Bell, Wifi, WifiOff, RefreshCw, LogOut, LayoutDashboard, Users, UserPlus,
   HeartPulse, Signpost, ClipboardList, CalendarDays, Video, UserCircle, Building2,
   ScrollText, Settings, Siren, ListOrdered, Activity, BellRing, CheckCheck, CloudOff,
+  AlertTriangle,
 } from "lucide-react";
 import { useAuth, useI18n, useConn, useApi } from "../store/providers";
 import { api } from "../store/backend";
@@ -188,7 +189,7 @@ function NotificationsDrawer({ open, onClose }: { open: boolean; onClose: () => 
 export function AppShell() {
   const { user } = useAuth();
   const { t, lang, setLang, langs } = useI18n();
-  const { offline, syncing, simOffline, setSimOffline, counts } = useConn();
+  const { offline, syncing, simOffline, setSimOffline, counts, serverReachable, netOnline } = useConn();
   const [drawer, setDrawer] = useState(false);
   const [notif, setNotif] = useState(false);
   const loc = useLocation();
@@ -198,8 +199,20 @@ export function AppShell() {
   useEffect(() => { setDrawer(false); }, [loc.pathname]);
   if (!user) return null;
 
-  const connTone = offline ? "bg-rose-50 text-rose-800 border-rose-200" : syncing ? "bg-amber-50 text-amber-800 border-amber-200" : "bg-emerald-50 text-emerald-800 border-emerald-200";
-  const connLabel = offline ? t("offline") : syncing ? t("syncing") : t("online");
+  // Status priority: offline > syncing > sync error > server unreachable > online
+  const syncError = counts.failed > 0;
+  const unreachable = netOnline && !serverReachable;
+  const connTone = offline ? "bg-rose-50 text-rose-800 border-rose-200"
+    : syncing ? "bg-amber-50 text-amber-800 border-amber-200"
+    : syncError ? "bg-amber-50 text-amber-900 border-amber-300"
+    : unreachable ? "bg-amber-50 text-amber-900 border-amber-300"
+    : "bg-emerald-50 text-emerald-800 border-emerald-200";
+  const connLabel = offline ? t("offline")
+    : syncing ? t("syncing")
+    : syncError ? `Sync error · ${counts.failed}`
+    : unreachable ? "Server unreachable"
+    : counts.pending > 0 ? `Online · ${counts.pending} queued`
+    : t("online");
 
   return (
     <div className="flex min-h-screen">
@@ -234,7 +247,10 @@ export function AppShell() {
                 title={simOffline ? "Reconnect (demo control)" : "Simulate offline (demo control)"}
                 className={cx("flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-bold transition", connTone)}
               >
-                {offline ? <CloudOff className="h-3.5 w-3.5" /> : syncing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Wifi className="h-3.5 w-3.5" />}
+                {offline ? <CloudOff className="h-3.5 w-3.5" />
+                  : syncing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  : syncError || unreachable ? <AlertTriangle className="h-3.5 w-3.5" />
+                  : <Wifi className="h-3.5 w-3.5" />}
                 <span className="hidden sm:inline">{connLabel}</span>
                 {counts.pending > 0 && <span className="rounded-full bg-clay-500 px-1.5 py-0.5 text-[10px] font-bold text-white">{counts.pending}</span>}
               </button>

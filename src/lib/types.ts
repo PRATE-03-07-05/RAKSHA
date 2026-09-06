@@ -47,6 +47,12 @@ export interface Assessment {
   inputs: { symptoms: string[]; sys?: number; dia?: number; temp?: number; spo2?: number; hr?: number; age: number; pregnant?: boolean; conditions: string[]; severity: string };
   level: RiskLevel; factors: TriageFactor[]; recommendation: string; version: string;
   confirmed: boolean; confirmedBy?: string; confirmedAt?: number;
+  /** Decision-support engine that produced this result (server-reported). */
+  mode?: "ML_MODEL" | "RULE_BASED_FALLBACK" | "OFFLINE_PROVISIONAL";
+  /** P(predicted class) when an ML model served the request. */
+  confidence?: number;
+  /** True while captured offline — the server re-evaluates on sync. */
+  pendingSync?: boolean;
 }
 
 export interface Consultation {
@@ -78,6 +84,8 @@ export interface Referral {
   vitalsSnapshot?: string; expectedDate: string;
   status: RefStatus; completedAt?: number; followUpDate?: string;
   events: ReferralEvent[];
+  /** Queued offline — NOT delivered to the receiving facility until synced. */
+  pendingSync?: boolean;
 }
 
 export interface FollowUp {

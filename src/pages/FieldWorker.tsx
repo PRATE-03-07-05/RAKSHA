@@ -342,7 +342,12 @@ export function ReferralPanel({ patient, assessment, onDone, fromFacilityId }: {
         clinicalSummary: form.summary || `${patient.name}, ${patient.age}y. ${v?.symptoms.join(", ") ?? ""}. ${vit ?? ""} AI-assisted level: ${level ?? "—"}.`,
         vitalsSnapshot: vit,
       });
-      toast(`Referral ${r.code} created & sent to ${facilityName(dest)}.`, "success");
+      toast(
+        r.pendingSync
+          ? `Referral saved offline — pending synchronization. It is NOT delivered to ${facilityName(dest)} until synced.`
+          : `Referral ${r.code} created & sent to ${facilityName(dest)}.`,
+        r.pendingSync ? "warning" : "success",
+      );
       onDone(r);
     } catch (e) { toast(e instanceof Error ? e.message : "Failed", "error"); }
     setSaving(false);
@@ -507,7 +512,27 @@ export function AssessFlow() {
               </div>
             </div>
             <div className="p-5">
-              <p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">Contributing factors</p>
+              {/* Engine transparency: which decision-support engine produced this */}
+              <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-brand-900/10 bg-brand-50/60 px-3.5 py-2.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">Decision support:</span>
+                {assessment.mode === "ML_MODEL" && (
+                  <Pill tone="brand">ML model · {assessment.version.replace(/^ml-/, "")}{typeof assessment.confidence === "number" ? ` · ${(assessment.confidence * 100).toFixed(0)}% confidence` : ""}</Pill>
+                )}
+                {assessment.mode === "RULE_BASED_FALLBACK" && (
+                  <Pill tone="amber">Rule-based engine — ML model unavailable</Pill>
+                )}
+                {assessment.mode === "OFFLINE_PROVISIONAL" && (
+                  <Pill tone="amber">Saved offline — server will assess on sync</Pill>
+                )}
+                {!assessment.mode && <Pill tone="slate">{assessment.version}</Pill>}
+              </div>
+              {assessment.pendingSync && (
+                <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
+                  Captured offline — this provisional reading is queued and the authoritative
+                  assessment will be computed by the server when connectivity returns.
+                </div>
+              )}
+              <p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">Why this result? — contributing factors</p>
               <ul className="space-y-2">
                 {assessment.factors.map(f => (
                   <li key={f.label} className="flex items-start gap-2.5 text-sm">
@@ -516,7 +541,7 @@ export function AssessFlow() {
                   </li>
                 ))}
               </ul>
-              <p className="mt-4 rounded-lg bg-brand-50 px-3.5 py-2.5 text-sm font-semibold text-brand-900">Suggested action: “{assessment.recommendation}”</p>
+              <p className="mt-4 rounded-lg bg-brand-50 px-3.5 py-2.5 text-sm font-semibold text-brand-900">Suggested workflow: “{assessment.recommendation.replace(/_/g, " ").toLowerCase()}”</p>
               <p className="mt-3 text-xs italic text-slate-500">{t("aiDisclaimer")}</p>
               <p className="mt-1 font-mono text-[10px] text-slate-400">{assessment.version}</p>
               <div className="mt-4 grid gap-2 sm:grid-cols-3">

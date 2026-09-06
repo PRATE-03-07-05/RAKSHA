@@ -108,9 +108,21 @@ COMPLETED requires an `outcome` (loop is not closed without a recorded outcome).
 ### Triage (decision support — not diagnosis)
 | Method | Path | Roles | Notes |
 |---|---|---|---|
-| POST | `/triage/assess` | field workers + clinicians | rule-based; returns `risk_level`, `recommended_action`, `red_flags`, `contributing_factors`, `rule_version`, disclaimer. With `patient_id`, result is persisted in the record. |
+| POST | `/triage/assess` | field workers + clinicians | ML model when a trained artifact exists (`mode=ML_MODEL` + `confidence`), transparent rule engine otherwise (`mode=RULE_BASED_FALLBACK`). Returns `risk_level`, `recommended_action`, `red_flags`, `contributing_factors`, disclaimer. With `patient_id`, result is persisted in the record. |
 | POST | `/triage/respiratory-risk` | same | compatibility alias |
 | GET | `/triage/config` | any | current thresholds (env-configurable) |
+| GET | `/triage/model` | any authenticated | active engine status (ML vs rule fallback, model name/version) |
+
+### ML pipeline (prototype decision support)
+```bash
+cd backend
+python -m ml.data.generate --rows 4000 --seed 42   # SYNTHETIC dev dataset (labelled)
+python -m ml.training.train --synthetic            # 5-fold stratified CV → joblib artifact
+python -m ml.evaluation.evaluate                   # held-out test metrics
+```
+Artifact: `ml/models/triage_model.joblib` (gitignored). Docker's first boot
+trains automatically if absent; any failure transparently falls back to the
+rule engine. See `docs/ML_TRIAGE.md` and `docs/ML_VIVA.md`.
 
 ### Facilities
 | Method | Path | Roles |
@@ -143,7 +155,7 @@ COMPLETED requires an `outcome` (loop is not closed without a recorded outcome).
 | Own profile / record | ✅ | — | — | — | — |
 | Register patient | ❌ | ✅ | ✅ | ❌ | ✅ |
 | Record visit / vitals | ❌ | ✅ | ✅ | ✅ | ❌ |
-| Triage assess | ❌ | ✅ | ✅ | ✅ | ❌ |
+| Triage assess (ML model, rule fallback if unavailable) | ❌ | ✅ | ✅ | ✅ | ❌ |
 | Consultation / prescription | ❌ | ❌ | ❌ | ✅ | ❌ |
 | Create referral | ❌ | ✅ | ✅ | ✅ | ❌ |
 | Acknowledge / accept (destination) | ❌ | ❌ | ack only | ✅ | ❌ |
@@ -166,7 +178,7 @@ See `backend/.env.example`: `DATABASE_URL`, `JWT_SECRET`, `JWT_ALGORITHM`,
 |---|---|
 | Auth / RBAC / patients / records / referral lifecycle / triage / appointments / facilities / admin analytics / audit / sync ledger | **Implemented** (tested) |
 | Facility resources, workload, map coordinates | **Demo data** (seeded) |
-| AI triage | **Transparent rule-based decision support** — not a medical device, no diagnosis claims |
+| AI triage | **Prototype decision support**: trained ML model (synthetic, labelled dataset) with a transparent rule-based fallback — not a medical device, no diagnosis claims |
 | SMS / EMAIL / FCM notifications | **Integration-ready** — dev-null providers write to the outbox; swap in real credentials at one point |
 | Teleconsultation | **Metadata only** — signaling is an isolated extension point, no fake video |
 | ABDM / FHIR / eSanjeevani / HMIS | **Integration-ready** — env placeholders; no live claims |
