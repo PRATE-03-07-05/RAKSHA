@@ -128,7 +128,11 @@ export function QueuePage() {
   const apQ = useApi(() => api.listAppointments(user as never), [user?.id]);
   const refQ = useApi(() => api.listReferrals(user as never), [user?.id]);
   const today = todayISO();
+  
   if (apQ.loading || refQ.loading) return <Spinner label={t("loading")} />;
+  if (apQ.error || refQ.error) {
+    return <EmptyState title="Failed to load patient queue" hint={apQ.error || refQ.error || "Unknown error"} />;
+  }
 
   const rows = useMemo(() => {
     const db = getDB();

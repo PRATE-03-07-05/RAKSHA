@@ -151,9 +151,21 @@ export function FacilitiesPage() {
   const { user } = useAuth();
   const fQ = useApi(() => api.listFacilities(user as never), [user?.id]);
   const [sel, setSel] = useState<string | null>(null);
+  
   if (fQ.loading) return <Spinner label={t("loading")} />;
+  if (fQ.error) return <EmptyState title="Failed to load facilities" hint={fQ.error} />;
+  
   const list = fQ.data ?? [];
   const selected = list.find(f => f.id === sel) ?? null;
+  
+  if (list.length === 0) {
+    return (
+      <div className="mx-auto max-w-6xl space-y-6">
+        <SectionHead kicker="Resource visibility" title={t("facilities")} right={<Pill tone="amber">{t("demoData")}</Pill>} />
+        <EmptyState title="No facilities found" hint="No facilities are currently registered in the system." />
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -244,8 +256,13 @@ export function BottleneckPage() {
   const { user } = useAuth();
   const aQ = useApi(() => api.adminAnalytics(user as never), [user?.id]);
   const refQ = useApi(() => api.listReferrals(user as never), [user?.id]);
+  
   if (aQ.loading || refQ.loading) return <Spinner label={t("loading")} />;
-  const b = aQ.data!.bottlenecks;
+  if (aQ.error || refQ.error) {
+    return <EmptyState title="Failed to load bottleneck data" hint={aQ.error || refQ.error || "Unknown error"} />;
+  }
+  
+  const b = aQ.data?.bottlenecks ?? [];
   const phcs = b.filter(x => x.facility.type === "PHC");
   const chcs = b.filter(x => x.facility.type === "CHC");
   const dh = aQ.data!.totals;
@@ -517,6 +534,7 @@ export function UserManagement() {
 function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const { user } = useAuth();
   const { toast } = useToast();
+  const facQ = useApi(() => api.listFacilities(user as never), []);
   const [form, setForm] = useState({
     email: "", name: "", password: "", role: "ASHA", facility_id: "", phone: "", specialty: "", district: "", village: ""
   });
@@ -565,8 +583,23 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
             <option value="DISTRICT_ADMIN">District Admin</option>
           </Select>
         </Field>
-        <Field label="Facility ID">
-          <Input value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))} />
+        <Field label="Facility" required>
+          {facQ.loading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <Spinner /> Loading facilities...
+            </div>
+          ) : facQ.error ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              Failed to load facilities
+            </div>
+          ) : (
+            <Select value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))}>
+              <option value="">Select a facility</option>
+              {(facQ.data ?? []).map(f => (
+                <option key={f.id} value={f.id}>{f.name} · {f.type} · {f.village}</option>
+              ))}
+            </Select>
+          )}
         </Field>
         <Field label="Specialty">
           <Input value={form.specialty} onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))} />
@@ -589,6 +622,7 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
 function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: () => void; onUpdated: () => void }) {
   const { user: currentUser } = useAuth();
   const { toast } = useToast();
+  const facQ = useApi(() => api.listFacilities(currentUser as never), []);
   const [form, setForm] = useState({
     name: u.name, role: u.role, facility_id: u.facilityId ?? "", phone: u.phone ?? "",
     specialty: u.specialty ?? "", district: u.district ?? "", village: u.village ?? ""
@@ -635,8 +669,23 @@ function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: (
             <option value="DISTRICT_ADMIN">District Admin</option>
           </Select>
         </Field>
-        <Field label="Facility ID">
-          <Input value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))} />
+        <Field label="Facility">
+          {facQ.loading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500">
+              <Spinner /> Loading facilities...
+            </div>
+          ) : facQ.error ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              Failed to load facilities
+            </div>
+          ) : (
+            <Select value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))}>
+              <option value="">No facility</option>
+              {(facQ.data ?? []).map(f => (
+                <option key={f.id} value={f.id}>{f.name} · {f.type} · {f.village}</option>
+              ))}
+            </Select>
+          )}
         </Field>
         <Field label="Specialty">
           <Input value={form.specialty} onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))} />
