@@ -36,6 +36,8 @@ services:
       CORS_ORIGINS: http://localhost:5173,http://localhost:4173,http://localhost:3000
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend/ml/models:/app/ml/models
     depends_on:
       db:
         condition: service_healthy

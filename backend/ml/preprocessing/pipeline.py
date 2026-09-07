@@ -28,7 +28,7 @@ def build_preprocessor() -> ColumnTransformer:
         ("encode", OrdinalEncoder(
             categories=[SEVERITY_VALUES],
             handle_unknown="use_encoded_value",
-            unknown_value=-1.0,
+            unknown_value=-1,
         )),
     ])
     return ColumnTransformer([

@@ -282,7 +282,7 @@ export function BottleneckPage() {
         <div className="space-y-3">
           <p className="text-center text-xs font-extrabold uppercase tracking-[0.16em] text-brand-500">District Hospital</p>
           <div className="rounded-xl border border-brand-900/10 bg-brand-950 p-4 text-white shadow-pop">
-            <p className="font-display text-sm font-bold">District Hospital Demapur</p>
+            <p className="font-display text-sm font-bold">{facilityName("F-DH-01")}</p>
             <p className="font-mono text-[11px] text-emerald-300">{dh.facilities} facilities feed here</p>
             <div className="mt-2 space-y-1 text-xs">
               <p className="flex justify-between"><span className="text-brand-300">Open referrals</span><b>{dhIn}</b></p>
