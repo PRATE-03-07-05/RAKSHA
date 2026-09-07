@@ -42,6 +42,7 @@ const D = {
   followups: { en: "Follow-ups", hi: "फ़ॉलो-अप", mr: "पाठपुरावा" },
   emergency: { en: "Emergency", hi: "आपातकाल", mr: "आणीबाणी" },
   auditLogs: { en: "Audit Logs", hi: "ऑडिट लॉग", mr: "ऑडिट लॉग" },
+  users: { en: "Users", hi: "उपयोगकर्ता", mr: "वापरकर्ते" },
   facilities: { en: "Facilities", hi: "स्वास्थ्य केंद्र", mr: "आरोग्य केंद्र्रे" },
   bottlenecks: { en: "Bottlenecks", hi: "बाधाएँ", mr: "अडथळे" },
   analytics: { en: "Analytics", hi: "एनालिटिक्स", mr: "विश्लेषण" },

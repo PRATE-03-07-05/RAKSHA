@@ -10,7 +10,7 @@ import { PatientRecordPage, CareJourneyPage } from "./pages/RecordPages";
 import { PatientHomePage, AppointmentsPage, ReferralListPage, TelePage, NotificationsPage, ProfilePage } from "./pages/PatientPortal";
 import { FieldDashboard, RegisterPage, PatientsPage, AssessFlow, FollowUpsPage, SyncCenterPage } from "./pages/FieldWorker";
 import { DoctorDashboard, QueuePage, DoctorReferralsPage, ReferralDetailPage, DoctorPatientPage, EmergencyPage } from "./pages/Doctor";
-import { AdminDashboard, FacilitiesPage, BottleneckPage, AuditPage, SettingsPage, AdminReferralsPage } from "./pages/Admin";
+import { AdminDashboard, FacilitiesPage, BottleneckPage, AuditPage, SettingsPage, AdminReferralsPage, UserManagement } from "./pages/Admin";
 import type { Role } from "./lib/types";
 
 const FIELD: Role[] = ["ASHA", "ANM", "PHC_STAFF"];
@@ -84,6 +84,7 @@ export default function App() {
             <Route path="facilities" element={<Gate roles={["DISTRICT_ADMIN"]}><FacilitiesPage /></Gate>} />
             <Route path="bottlenecks" element={<Gate roles={["DISTRICT_ADMIN"]}><BottleneckPage /></Gate>} />
             <Route path="audit" element={<Gate roles={["DISTRICT_ADMIN"]}><AuditPage /></Gate>} />
+            <Route path="users" element={<Gate roles={["DISTRICT_ADMIN"]}><UserManagement /></Gate>} />
             <Route path="settings" element={<Gate roles={["DISTRICT_ADMIN"]}><SettingsPage /></Gate>} />
             <Route path="profile" element={<ProfilePage />} />
           </Route>

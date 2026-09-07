@@ -15,7 +15,8 @@ import { useAuth, useApi, useI18n, useToast } from "../store/providers";
 import { Card, StatCard, Pill, Btn, Spinner, EmptyState, SectionHead, AvailBadge, Input, Select, KV, RefStatusBadge, Banner } from "../components/ui";
 import { isOverdue } from "../store/backend";
 import { fmtDT, relTime, cx } from "../lib/utils";
-import type { Referral } from "../lib/types";
+import type { Referral, User, Role } from "../lib/types";
+import { Avatar, Modal, Field } from "../components/ui";
 
 const CHART_TOOLTIP = { contentStyle: { borderRadius: 10, border: "1px solid #d8eae3", fontSize: 12, fontFamily: "IBM Plex Sans" }, labelStyle: { fontWeight: 700 } };
 
@@ -36,7 +37,7 @@ export function AdminDashboard() {
     <div className="mx-auto max-w-6xl space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-clay-600">District Command Center · Demapur</p>
+          <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-clay-600">District Command Center · {user!.district ?? "District"}</p>
           <h1 className="font-display text-2xl font-extrabold tracking-tight text-brand-950 sm:text-3xl">Where does care get stuck?</h1>
         </div>
         <div className="flex items-center gap-2">
@@ -411,5 +412,249 @@ export function AdminReferralsPage() {
         );
       })}
     </div>
+  );
+}
+
+/* --------------------------------------------------------- user management */
+
+export function UserManagement() {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const usersQ = useApi(() => api.adminListUsers(user as never), [user?.id]);
+  const [search, setSearch] = useState("");
+  const [showCreate, setShowCreate] = useState(false);
+  const [editing, setEditing] = useState<User | null>(null);
+
+  if (usersQ.loading) return <Spinner label="Loading users…" />;
+  if (usersQ.error) return <EmptyState title="Failed to load users" hint={usersQ.error} />;
+
+  const users = usersQ.data ?? [];
+  const filtered = search
+    ? users.filter(u => u.name.toLowerCase().includes(search.toLowerCase()) ||
+                        u.email.toLowerCase().includes(search.toLowerCase()) ||
+                        u.role.toLowerCase().includes(search.toLowerCase()))
+    : users;
+
+  return (
+    <div className="mx-auto max-w-6xl space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-clay-600">User Management</p>
+          <h1 className="font-display text-2xl font-extrabold tracking-tight text-brand-950 sm:text-3xl">System Users</h1>
+        </div>
+        <Btn onClick={() => setShowCreate(true)}><Users className="h-4 w-4" /> Create User</Btn>
+      </div>
+
+      <Card>
+        <div className="mb-4">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <Input
+              className="pl-10"
+              placeholder="Search by name, email, or role…"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {filtered.length === 0 ? (
+          <EmptyState title="No users found" hint={search ? "Try a different search term" : "Create your first user"} />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-brand-900/10 text-left text-xs font-bold uppercase tracking-wider text-slate-500">
+                  <th className="pb-2 pr-4">Name</th>
+                  <th className="pb-2 pr-4">Email</th>
+                  <th className="pb-2 pr-4">Role</th>
+                  <th className="pb-2 pr-4">Facility</th>
+                  <th className="pb-2 pr-4">Status</th>
+                  <th className="pb-2">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-brand-900/5">
+                {filtered.map(u => (
+                  <tr key={u.id} className="hover:bg-brand-50/40">
+                    <td className="py-3 pr-4">
+                      <div className="flex items-center gap-2">
+                        <Avatar name={u.name} className="h-8 w-8 text-xs" />
+                        <div>
+                          <p className="font-semibold text-brand-950">{u.name}</p>
+                          <p className="text-xs text-slate-500">{u.specialty ?? "—"}</p>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="py-3 pr-4 font-mono text-xs text-slate-600">{u.email}</td>
+                    <td className="py-3 pr-4">
+                      <Pill tone={u.role === "DISTRICT_ADMIN" ? "amber" : u.role.includes("DOCTOR") ? "brand" : "slate"}>
+                        {u.role.replace("_", " ")}
+                      </Pill>
+                    </td>
+                    <td className="py-3 pr-4 text-xs text-slate-600">{facilityName(u.facilityId)}</td>
+                    <td className="py-3 pr-4">
+                      <Pill tone="green">Active</Pill>
+                    </td>
+                    <td className="py-3">
+                      <div className="flex gap-2">
+                        <Btn size="sm" variant="secondary" onClick={() => setEditing(u)}>Edit</Btn>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} onCreated={() => { setShowCreate(false); usersQ.reload(); }} />}
+      {editing && <EditUserModal user={editing} onClose={() => setEditing(null)} onUpdated={() => { setEditing(null); usersQ.reload(); }} />}
+    </div>
+  );
+}
+
+function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [form, setForm] = useState({
+    email: "", name: "", password: "", role: "ASHA", facility_id: "", phone: "", specialty: "", district: "", village: ""
+  });
+  const [saving, setSaving] = useState(false);
+
+  const submit = async () => {
+    if (!form.email || !form.name || !form.password) {
+      toast("Email, name, and password are required", "error");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.adminCreateUser(user as never, form);
+      toast("User created successfully", "success");
+      onCreated();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to create user", "error");
+    }
+    setSaving(false);
+  };
+
+  return (
+    <Modal open onClose={onClose} title="Create New User" wide>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Full Name" required>
+          <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+        </Field>
+        <Field label="Email" required>
+          <Input type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+        </Field>
+        <Field label="Password" required>
+          <Input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} />
+        </Field>
+        <Field label="Phone">
+          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
+        </Field>
+        <Field label="Role" required>
+          <Select value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))}>
+            <option value="PATIENT">Patient</option>
+            <option value="ASHA">ASHA</option>
+            <option value="ANM">ANM</option>
+            <option value="PHC_STAFF">PHC Staff</option>
+            <option value="PHC_DOCTOR">PHC Doctor</option>
+            <option value="CHC_DOCTOR">CHC Doctor</option>
+            <option value="SPECIALIST">Specialist</option>
+            <option value="DISTRICT_ADMIN">District Admin</option>
+          </Select>
+        </Field>
+        <Field label="Facility ID">
+          <Input value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))} />
+        </Field>
+        <Field label="Specialty">
+          <Input value={form.specialty} onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))} />
+        </Field>
+        <Field label="District">
+          <Input value={form.district} onChange={e => setForm(f => ({ ...f, district: e.target.value }))} />
+        </Field>
+        <Field label="Village">
+          <Input value={form.village} onChange={e => setForm(f => ({ ...f, village: e.target.value }))} />
+        </Field>
+      </div>
+      <div className="mt-6 flex justify-end gap-2">
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn loading={saving} onClick={() => void submit()}>Create User</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: () => void; onUpdated: () => void }) {
+  const { user: currentUser } = useAuth();
+  const { toast } = useToast();
+  const [form, setForm] = useState({
+    name: u.name, role: u.role, facility_id: u.facilityId ?? "", phone: u.phone ?? "",
+    specialty: u.specialty ?? "", district: u.district ?? "", village: u.village ?? ""
+  });
+  const [newPassword, setNewPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await api.adminUpdateUser(currentUser as never, u.id, form);
+      if (newPassword) {
+        await api.adminResetPassword(currentUser as never, u.id, newPassword);
+      }
+      toast("User updated successfully", "success");
+      onUpdated();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to update user", "error");
+    }
+    setSaving(false);
+  };
+
+  return (
+    <Modal open onClose={onClose} title={`Edit User — ${u.name}`} wide>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Full Name">
+          <Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+        </Field>
+        <Field label="Email">
+          <Input type="email" value={u.email} disabled />
+        </Field>
+        <Field label="Phone">
+          <Input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
+        </Field>
+        <Field label="Role">
+          <Select value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value as Role }))}>
+            <option value="PATIENT">Patient</option>
+            <option value="ASHA">ASHA</option>
+            <option value="ANM">ANM</option>
+            <option value="PHC_STAFF">PHC Staff</option>
+            <option value="PHC_DOCTOR">PHC Doctor</option>
+            <option value="CHC_DOCTOR">CHC Doctor</option>
+            <option value="SPECIALIST">Specialist</option>
+            <option value="DISTRICT_ADMIN">District Admin</option>
+          </Select>
+        </Field>
+        <Field label="Facility ID">
+          <Input value={form.facility_id} onChange={e => setForm(f => ({ ...f, facility_id: e.target.value }))} />
+        </Field>
+        <Field label="Specialty">
+          <Input value={form.specialty} onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))} />
+        </Field>
+        <Field label="District">
+          <Input value={form.district} onChange={e => setForm(f => ({ ...f, district: e.target.value }))} />
+        </Field>
+        <Field label="Village">
+          <Input value={form.village} onChange={e => setForm(f => ({ ...f, village: e.target.value }))} />
+        </Field>
+        <Field label="Reset Password (optional)">
+          <Input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="Leave blank to keep current" />
+        </Field>
+      </div>
+      <div className="mt-6 flex justify-end gap-2">
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn loading={saving} onClick={() => void submit()}>Save Changes</Btn>
+      </div>
+    </Modal>
   );
 }

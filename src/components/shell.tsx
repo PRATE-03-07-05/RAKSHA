@@ -85,6 +85,7 @@ const NAV: Record<Role, NavItem[]> = {
     { to: "/app/referrals", key: "referrals", icon: <Signpost className="h-[18px] w-[18px]" /> },
     { to: "/app/bottlenecks", key: "bottlenecks", icon: <Activity className="h-[18px] w-[18px]" /> },
     { to: "/app/audit", key: "auditLogs", icon: <ScrollText className="h-[18px] w-[18px]" /> },
+    { to: "/app/users", key: "users", icon: <UserCircle className="h-[18px] w-[18px]" /> },
     { to: "/app/settings", key: "settings", icon: <Settings className="h-[18px] w-[18px]" /> },
     { to: "/app/notifications", key: "notifications", icon: <Bell className="h-[18px] w-[18px]" /> },
   ],
