@@ -131,7 +131,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
             <LogOut className="h-4.5 w-4.5" />
           </button>
         </div>
-        <p className="mt-3 text-center text-[10px] text-brand-400">SIH 2026 · Prototype build</p>
+        <p className="mt-3 text-center text-[10px] text-brand-400">RAKSHA · Prototype build</p>
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-/** RAKSHA sign-in with one-tap SIH demo logins. */
+/** RAKSHA sign-in with one-tap demo logins. */
 import React, { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
