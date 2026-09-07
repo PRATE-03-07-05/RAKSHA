@@ -14,7 +14,7 @@ export type RefStatus =
 
 export interface User {
   id: string; email: string; password: string; name: string;
-  role: Role; facilityId?: string; village?: string; phone: string;
+  role: Role; facilityId?: string; village?: string; district?: string; phone: string;
   specialty?: string;
 }
 

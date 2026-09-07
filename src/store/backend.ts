@@ -121,6 +121,7 @@ function mapUser(u: AnyObj): User {
   return {
     id: u.id, email: u.email, password: "", name: u.name, role: u.role as Role,
     facilityId: u.facility_id ?? undefined, village: u.village ?? undefined,
+    district: u.district ?? undefined,
     phone: u.phone ?? "", specialty: u.specialty ?? undefined,
   };
 }
@@ -1091,6 +1092,35 @@ export const api = {
     requirePerm(u, "audit.read");
     const rows = await rq<AnyObj[]>("GET", "/admin/audit-logs?limit=300");
     return rows.map(mapAudit);
+  },
+
+  /* ---- admin user management */
+  async adminListUsers(user: User | null) {
+    const u = requireUser(user);
+    requirePerm(u, "admin.read");
+    const rows = await rq<AnyObj[]>("GET", "/admin/users");
+    return rows.map(mapUser);
+  },
+
+  async adminCreateUser(user: User | null, data: { email: string; name: string; password: string; role: string; facility_id?: string; phone?: string; specialty?: string; district?: string; village?: string }) {
+    const u = requireUser(user);
+    requirePerm(u, "admin.read");
+    const created = await rq<AnyObj>("POST", "/admin/users", { body: data });
+    return mapUser(created);
+  },
+
+  async adminUpdateUser(user: User | null, userId: string, data: { name?: string; role?: string; facility_id?: string; phone?: string; specialty?: string; district?: string; village?: string; is_active?: boolean }) {
+    const u = requireUser(user);
+    requirePerm(u, "admin.read");
+    const updated = await rq<AnyObj>("PATCH", `/admin/users/${userId}`, { body: data });
+    return mapUser(updated);
+  },
+
+  async adminResetPassword(user: User | null, userId: string, newPassword: string) {
+    const u = requireUser(user);
+    requirePerm(u, "admin.read");
+    const updated = await rq<AnyObj>("POST", `/admin/users/${userId}/reset-password`, { body: { new_password: newPassword } });
+    return mapUser(updated);
   },
 
   /* ---- sync (POST /sync/batch — idempotent by client operation id) */
