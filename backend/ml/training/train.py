@@ -87,9 +87,10 @@ def main() -> None:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=args.test_size, stratify=y, random_state=args.seed)
 
-    scorer = make_scorer(
-        lambda est, Xv, yv: blended_selection_score(yv, est.predict(Xv)),
-        greater_is_better=True)
+    def blended_scorer(y_true, y_pred):
+        return blended_selection_score(y_true, y_pred)
+
+    scorer = make_scorer(blended_scorer, greater_is_better=True)
     cv = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
 
     print(f"[train] {args.cv_folds}-fold stratified CV "
