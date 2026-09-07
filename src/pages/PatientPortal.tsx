@@ -158,7 +158,9 @@ export function AppointmentsPage() {
           </div>
         </Card>
         <Card title="My appointments">
-          {apQ.loading ? <Spinner /> : (apQ.data ?? []).length === 0 ? <EmptyState title={t("noData")} hint="Book your first visit." /> : (
+          {apQ.loading ? <Spinner /> : 
+           apQ.error ? <EmptyState title="Failed to load appointments" hint={apQ.error} /> :
+           (apQ.data ?? []).length === 0 ? <EmptyState title={t("noData")} hint="Book your first visit." /> : (
             <div className="space-y-2.5">
               {(apQ.data ?? []).map(a => (
                 <div key={a.id} className="flex items-center justify-between gap-3 rounded-lg border border-brand-900/10 p-3">
