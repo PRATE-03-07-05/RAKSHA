@@ -1,7 +1,7 @@
 /** RAKSHA UI primitives — buttons, cards, badges, forms, modal, states. */
 import React, { useEffect } from "react";
 import { X, Loader2, Inbox } from "lucide-react";
-import { cx, initials, qrMatrix } from "../lib/utils";
+import { cx, initials } from "../lib/utils";
 import { useI18n } from "../store/providers";
 import type { Availability, RefStatus, RiskLevel } from "../lib/types";
 
@@ -212,16 +212,6 @@ export function Avatar({ name, className }: { name: string; className?: string }
     <span className={cx("inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-brand-700 font-display text-xs font-bold text-brand-50", className)}>
       {initials(name)}
     </span>
-  );
-}
-
-export function QRCard({ text, size = 120 }: { text: string; size?: number }) {
-  const grid = qrMatrix(text);
-  const cell = size / grid.length;
-  return (
-    <svg width={size} height={size} role="img" aria-label={`QR code for ${text}`} className="rounded-lg border border-brand-900/15 bg-white p-1">
-      {grid.map((row, r) => row.map((on, c) => on ? <rect key={`${r}-${c}`} x={c * cell} y={r * cell} width={cell + 0.4} height={cell + 0.4} fill="#0a2b24" /> : null))}
-    </svg>
   );
 }
 

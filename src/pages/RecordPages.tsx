@@ -8,7 +8,8 @@ import {
 } from "lucide-react";
 import { api, getDB, buildAiSummary, toFhirBundle, facilityName, followUpState, isOverdue } from "../store/backend";
 import { useAuth, useApi, useI18n } from "../store/providers";
-import { Card, Pill as StatusPill, RiskBadge, RefStatusBadge, Modal, Btn, Spinner, EmptyState, KV, Banner, QRCard, SectionHead, Avatar } from "../components/ui";
+import { Card, Pill as StatusPill, RiskBadge, RefStatusBadge, Modal, Btn, Spinner, EmptyState, KV, Banner, SectionHead, Avatar } from "../components/ui";
+import { QRCode } from "../components/QRCode";
 import type { TimelineEvent, TimelineKind, Patient, Referral, FollowUp } from "../lib/types";
 import { fmtD, fmtDT, fmtShort, fmtTime, cx, daysUntil } from "../lib/utils";
 
@@ -197,8 +198,8 @@ export function PatientRecordPage() {
         </Card>
         <div className="flex items-center justify-center rounded-xl border border-brand-900/10 bg-white p-4 shadow-card">
           <div className="text-center">
-            <QRCard text={p.rakId} size={112} />
-            <p className="mt-2 font-mono text-[10px] font-semibold text-brand-500">RAKSHA ID QR · demo</p>
+            <QRCode value={`${window.location.origin}/qr/patient/${p.id}`} size={112} />
+            <p className="mt-2 font-mono text-[10px] font-semibold text-brand-500">Scan to view patient info</p>
           </div>
         </div>
       </div>
