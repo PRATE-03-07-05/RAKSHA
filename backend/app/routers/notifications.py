@@ -6,7 +6,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Notification
+from ..models import Notification, NotificationChannel
 from ..schemas import NotificationOut
 from ..security import CurrentUser
 
@@ -18,7 +18,7 @@ DB = Annotated[Session, Depends(get_db)]
 def list_notifications(user: CurrentUser, db: DB):
     rows = db.execute(
         select(Notification)
-        .where(Notification.user_id == user.id, Notification.channel == "IN_APP")
+        .where(Notification.user_id == user.id, Notification.channel == NotificationChannel.IN_APP)
         .order_by(Notification.created_at.desc())
         .limit(60)
     ).scalars().all()
@@ -38,5 +38,8 @@ def mark_read(notification_id: str, user: CurrentUser, db: DB):
 
 @router.post("/read-all", status_code=status.HTTP_204_NO_CONTENT, summary="Mark all as read")
 def mark_all_read(user: CurrentUser, db: DB):
-    db.execute(update(Notification).where(Notification.user_id == user.id).values(read=True))
+    # Only in-app notifications have a read state; SMS outbox delivery flags
+    # must not be conflated with reads.
+    db.execute(update(Notification).where(Notification.user_id == user.id,
+                                          Notification.channel == NotificationChannel.IN_APP).values(read=True))
     db.commit()

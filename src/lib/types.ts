@@ -44,7 +44,7 @@ export interface Vitals {
 export interface TriageFactor { label: string; detail: string; severity: "info" | "warn" | "high" | "critical"; }
 export interface Assessment {
   id: string; patientId: string; workerId: string; workerName: string; role: Role; ts: number;
-  inputs: { symptoms: string[]; sys?: number; dia?: number; temp?: number; spo2?: number; hr?: number; age: number; pregnant?: boolean; conditions: string[]; severity: string };
+  inputs: { symptoms: string[]; sys?: number; dia?: number; temp?: number; spo2?: number; hr?: number; rr?: number; age: number; pregnant?: boolean; conditions: string[]; severity: string };
   level: RiskLevel; factors: TriageFactor[]; recommendation: string; version: string;
   confirmed: boolean; confirmedBy?: string; confirmedAt?: number;
   /** Decision-support engine that produced this result (server-reported). */
@@ -98,6 +98,21 @@ export interface Appointment {
   id: string; patientId: string; facilityId: string; date: string; time: string;
   purpose: string; status: "REQUESTED" | "CONFIRMED" | "IN_QUEUE" | "COMPLETED" | "CANCELLED";
   queuePos?: number;
+}
+
+export type QueueStatus = "WAITING" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+
+export interface ClinicalQueueItem {
+  id: string; patientId: string; patientName: string; age: number; sex: string;
+  phone: string; village: string; queueStatus: QueueStatus; priority: RiskLevel;
+  priorityScore: number; triageLevel: string; arrivalTime: number; scheduledTime: number;
+  waitingMinutes: number; assignedFacilityId: string; assignedClinicianId: string;
+  referralId?: string; reason: string; source: "appointment" | "referral";
+}
+
+export interface ClinicalQueueResponse {
+  items: ClinicalQueueItem[]; total: number; limit: number; offset: number;
+  generatedAt: number; facilityId?: string; role: string;
 }
 
 export interface Teleconsultation {

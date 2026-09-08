@@ -17,6 +17,9 @@ from ..schemas import TriageFactor, TriageRequest, TriageResponse
 log = logging.getLogger("raksha.triage")
 
 _CHRONIC = {"diabetes", "hypertension", "asthma", "copd", "tuberculosis", "tb", "cardiac", "heart"}
+# Substring/alias matching so "Type 2 Diabetes" / "HTN" are not missed.
+_CHRONIC_ALIASES = _CHRONIC | {"htn", "dm", "type 2 diabetes", "type 1 diabetes", "bp", "high bp",
+                               "high blood pressure", "heart disease", "kidney", "cancer"}
 
 ACTION_BY_LEVEL = {
     RiskLevel.LOW: "HOME_CARE_ADVICE",
@@ -77,7 +80,7 @@ def assess(req: TriageRequest) -> TriageResponse:
         add("AGE_CHILD", f"Age {req.age} — infant/child risk", 15, red_flag=True)
     if req.pregnant:
         add("PREGNANCY", "Pregnancy — treat with extra caution", 10)
-    chronic = [c for c in req.conditions if c.lower() in _CHRONIC]
+    chronic = [c for c in req.conditions if any(k in c.lower() for k in _CHRONIC_ALIASES)]
     if chronic:
         add("CHRONIC_CONDITIONS", f"Known conditions: {', '.join(chronic)}", min(8 * len(chronic), 16))
 
@@ -193,6 +196,10 @@ def assess_with_fallback(req: TriageRequest) -> TriageResponse:
 def persist(db: Session, actor: User, req: TriageRequest, result: TriageResponse,
             visit_id: str | None = None) -> Assessment:
     """Store the assessment in the longitudinal record with the rule version."""
+    from fastapi import HTTPException, status as _status
+    from ..models import Patient as _Patient
+    if not req.patient_id or db.get(_Patient, req.patient_id) is None:
+        raise HTTPException(_status.HTTP_404_NOT_FOUND, "Patient not found")
     a = Assessment(
         patient_id=req.patient_id or "",
         visit_id=visit_id,

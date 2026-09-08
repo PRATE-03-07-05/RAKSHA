@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import Role, SyncOperation, SyncStatus
 from ..schemas import SyncBatchIn, SyncBatchOut, SyncStatusOut
-from ..security import FIELD_WORKERS, CurrentUser, require_roles
+from ..security import CLINICAL, FIELD_WORKERS, CurrentUser, require_roles
 from ..services.sync import apply_batch
 
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -23,7 +23,7 @@ DB = Annotated[Session, Depends(get_db)]
 
 @router.post("/batch", response_model=SyncBatchOut,
              summary="Apply a batch of queued offline operations (idempotent)",
-             dependencies=[Depends(require_roles(*FIELD_WORKERS, Role.DISTRICT_ADMIN))])
+             dependencies=[Depends(require_roles(*FIELD_WORKERS, *CLINICAL, Role.DISTRICT_ADMIN))])
 def sync_batch(body: SyncBatchIn, user: CurrentUser, db: DB):
     results, applied, conflicts, duplicates = apply_batch(db, user, body)
     db.commit()

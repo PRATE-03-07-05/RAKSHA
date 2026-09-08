@@ -12,17 +12,16 @@ export const API_BASE: string =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ??
   "http://localhost:8000";
 
+import { getToken as platformGetToken, setToken as platformSetToken } from "../platform/token";
+
 export const TOKEN_KEY = "raksha.session.v1";
 
 export function getToken(): string | null {
-  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
+  return platformGetToken();
 }
 
 export function setToken(token: string | null): void {
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch { /* storage unavailable — session simply won't persist */ }
+  platformSetToken(token);
 }
 
 export class ApiError extends Error {
@@ -37,6 +36,8 @@ export class ApiError extends Error {
 interface RqOpts {
   body?: unknown;
   headers?: Record<string, string>;
+  /** Public endpoints (QR) must not clear the session on 401. */
+  public?: boolean;
 }
 
 export async function rq<T = unknown>(method: string, path: string, opts?: RqOpts): Promise<T> {
@@ -70,7 +71,7 @@ export async function rq<T = unknown>(method: string, path: string, opts?: RqOpt
         .map(e => `${(e.loc ?? []).slice(1).join(".") || "body"}: ${e.msg ?? "invalid"}`)
         .join("; ");
     }
-    if (res.status === 401) setToken(null);
+    if (res.status === 401 && !opts?.public) setToken(null);
     throw new ApiError(res.status, msg);
   }
   return data as T;

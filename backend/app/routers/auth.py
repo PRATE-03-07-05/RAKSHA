@@ -20,13 +20,13 @@ def login(body: LoginRequest, request: Request, db: Annotated[Session, Depends(g
     user = db.execute(select(User).where(User.email == body.email.lower())).scalar_one_or_none()
     ip = request.client.host if request.client else None
 
-    if user is None or not verify_password(body.password, user.password_hash):
+    # Generic message for all failures (bad email, bad password, disabled)
+    # to avoid an account-validity oracle. Details go to audit log only.
+    if user is None or not verify_password(body.password, user.password_hash) or not user.is_active:
         log_action(db, None, AuditAction.LOGIN_FAILED, "user", None,
                    detail={"email": body.email.lower()}, ip=ip)
         db.commit()
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
-    if not user.is_active:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Account disabled")
 
     token = create_access_token(user.id, user.role.value)
     log_action(db, user, AuditAction.LOGIN, "user", user.id, ip=ip)

@@ -32,29 +32,32 @@ const KIND_META: Record<TimelineKind, { icon: React.ReactNode; cls: string; labe
 function EventDetail({ ev }: { ev: TimelineEvent }) {
   const d = ev.data as Record<string, never>;
   if (ev.kind === "assessment") {
-    const a = d as never as { level: string; factors: { label: string; detail: string; severity: string }[]; recommendation: string; confirmed: boolean; confirmedBy?: string; version: string };
+    const a = d as never as { level?: string; factors?: { label: string; detail: string; severity: string }[]; recommendation?: string; confirmed?: boolean; confirmedBy?: string; version?: string };
+    const factors = Array.isArray(a.factors) ? a.factors : [];
     return (
       <div className="mt-2 space-y-2">
-        {a.factors.map(f => (
+        {factors.length === 0 && <p className="text-xs text-slate-500">Assessment {a.level ?? ""} — details pending sync.</p>}
+        {factors.map(f => (
           <div key={f.label} className="flex items-start gap-2 text-xs">
             <span className={cx("mt-1 h-1.5 w-1.5 shrink-0 rounded-full", f.severity === "critical" ? "bg-rose-500" : f.severity === "high" ? "bg-orange-500" : f.severity === "warn" ? "bg-amber-500" : "bg-emerald-500")} />
             <span><b>{f.label}.</b> <span className="text-slate-500">{f.detail}</span></span>
           </div>
         ))}
-        <p className="rounded-md bg-brand-50 px-2.5 py-1.5 text-xs text-brand-800">{a.recommendation}</p>
-        <p className="text-[10px] text-slate-400">{a.version} · {a.confirmed ? `confirmed by ${a.confirmedBy}` : "awaiting clinician confirmation"} · AI-assisted, not a diagnosis</p>
+        {a.recommendation && <p className="rounded-md bg-brand-50 px-2.5 py-1.5 text-xs text-brand-800">{a.recommendation}</p>}
+        <p className="text-[10px] text-slate-400">{a.version ?? ""} · {a.confirmed ? `confirmed by ${a.confirmedBy}` : "awaiting clinician confirmation"} · AI-assisted, not a diagnosis</p>
       </div>
     );
   }
   if (ev.kind === "referral") {
     const r = d as never as Referral;
+    if (!r || !r.status) return <p className="mt-2 text-xs text-slate-500">Referral details pending sync.</p>;
     return (
       <div className="mt-2">
         <RefStatusBadge status={r.status} overdue={isOverdue(r)} />
         <div className="mt-2 space-y-1">
-          {r.events.slice(0, 6).map(e => (
+          {(r.events ?? []).slice(0, 6).map(e => (
             <p key={e.id} className="flex items-baseline gap-2 text-[11px] text-slate-500">
-              <span className="font-mono font-semibold text-brand-700">{fmtTime(e.ts)}</span> {e.to.replace("_", " ")} · {e.actorName} @ {facilityName(e.facilityId)}
+              <span className="font-mono font-semibold text-brand-700">{fmtTime(e.ts)}</span> {(e.to ?? "").replace("_", " ")} · {e.actorName} @ {facilityName(e.facilityId)}
             </p>
           ))}
         </div>
@@ -62,8 +65,10 @@ function EventDetail({ ev }: { ev: TimelineEvent }) {
     );
   }
   if (ev.kind === "prescription") {
-    const rx = d as never as { meds: { name: string; dose: string; duration: string }[] };
-    return <div className="mt-2 space-y-1">{rx.meds.map(m => <p key={m.name} className="text-xs text-slate-600"><b>{m.name}</b> — {m.dose} · {m.duration}</p>)}</div>;
+    const rx = d as never as { meds?: { name: string; dose: string; duration: string }[] };
+    const meds = Array.isArray(rx.meds) ? rx.meds : [];
+    if (!meds.length) return <p className="mt-2 text-xs text-slate-500">Prescription pending sync.</p>;
+    return <div className="mt-2 space-y-1">{meds.map(m => <p key={m.name} className="text-xs text-slate-600"><b>{m.name}</b> — {m.dose} · {m.duration}</p>)}</div>;
   }
   if (ev.kind === "vitals") {
     const v = d as never as { sys?: number; dia?: number; temp?: number; spo2?: number; hr?: number; rr?: number; weight?: number; device?: string; workerName: string };
@@ -84,6 +89,7 @@ function EventDetail({ ev }: { ev: TimelineEvent }) {
   }
   if (ev.kind === "followup") {
     const f = d as never as FollowUp;
+    if (!f || !f.status) return <p className="mt-2 text-xs text-slate-500">Follow-up pending sync.</p>;
     const st = followUpState(f);
     return <div className="mt-2 flex items-center gap-2 text-xs"><StatusPill tone={st === "OVERDUE" ? "red" : st === "COMPLETED" ? "green" : st === "DUE_TODAY" ? "amber" : "sky"}>{st.replace("_", " ")}</StatusPill><span className="text-slate-500">{f.notes}</span></div>;
   }
@@ -114,7 +120,7 @@ export function TimelineList({ events, limit }: { events: TimelineEvent[]; limit
             </p>
             <div className="ml-10 space-y-2">
               {evs.map(ev => {
-                const meta = KIND_META[ev.kind];
+                const meta = KIND_META[ev.kind] ?? { icon: null, cls: "bg-slate-200 text-slate-700", label: ev.kind };
                 const open = expanded === ev.id;
                 return (
                   <div key={ev.id} className="overflow-hidden rounded-xl border border-brand-900/10 bg-white shadow-card transition hover:border-brand-300">

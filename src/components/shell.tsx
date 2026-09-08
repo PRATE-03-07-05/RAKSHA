@@ -243,10 +243,10 @@ export function AppShell() {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => setSimOffline(!simOffline)}
-                title={simOffline ? "Reconnect (demo control)" : "Simulate offline (demo control)"}
-                className={cx("flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-bold transition", connTone)}
+              <span
+                title={simOffline ? "Offline simulation ON (demo control — toggle in Sync Center)" : "Online"}
+                aria-live="polite"
+                className={cx("flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-bold", connTone)}
               >
                 {offline ? <CloudOff className="h-3.5 w-3.5" />
                   : syncing ? <RefreshCw className="h-3.5 w-3.5 animate-spin" />
@@ -254,7 +254,7 @@ export function AppShell() {
                   : <Wifi className="h-3.5 w-3.5" />}
                 <span className="hidden sm:inline">{connLabel}</span>
                 {counts.pending > 0 && <span className="rounded-full bg-clay-500 px-1.5 py-0.5 text-[10px] font-bold text-white">{counts.pending}</span>}
-              </button>
+              </span>
               <div className="hidden items-center overflow-hidden rounded-full border border-brand-900/10 bg-white md:flex" role="group" aria-label={t("language")}>
                 {langs.map(l => (
                   <button key={l.code} onClick={() => setLang(l.code)} className={cx("px-2.5 py-1.5 text-[11px] font-bold transition", lang === l.code ? "bg-brand-800 text-white" : "text-slate-500 hover:text-brand-800")}>

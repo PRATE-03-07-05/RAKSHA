@@ -128,6 +128,8 @@ def update_patient(patient_id: str, body: PatientUpdate, user: CurrentUser, db: 
         p.consent_granted = body.consent_granted
         p.consent_at = datetime.now(timezone.utc) if body.consent_granted else None
         changes["consent_granted"] = body.consent_granted
+    if not changes:
+        return _pout(db, p)  # no-op: do not bump version on empty update
     p.version += 1  # exactly one increment per accepted update
     log_action(db, user, AuditAction.PATIENT_UPDATE, "patient", p.id, patient_id=p.id,
                detail={"fields": sorted(changes.keys()), "version": p.version})
@@ -185,5 +187,9 @@ def timeline(patient_id: str, user: CurrentUser, db: DB):
                                     subtitle=(t.assessment or "scheduled")[:90]))
 
     db.commit()
-    events.sort(key=lambda e: e.ts, reverse=True)
+    def _aware(dt):
+        if dt is None:
+            return dt
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    events.sort(key=lambda e: _aware(e.ts) or _aware(datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
     return events

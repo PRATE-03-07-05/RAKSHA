@@ -399,18 +399,18 @@ class FacilityResourceOut(ORM):
 
 
 class FacilityResourceUpdate(BaseModel):
-    total_beds: int | None = None
-    available_beds: int | None = None
-    icu_beds: int | None = None
+    total_beds: int | None = Field(default=None, ge=0, le=5000)
+    available_beds: int | None = Field(default=None, ge=0, le=5000)
+    icu_beds: int | None = Field(default=None, ge=0, le=1000)
     oxygen_available: bool | None = None
     ambulance_available: bool | None = None
     emergency_available: bool | None = None
-    cbc: str | None = None
-    xray: str | None = None
-    ultrasound: str | None = None
-    medicines: list | None = None
-    specialists: list | None = None
-    workload_level: str | None = None
+    cbc: str | None = Field(default=None, pattern="^(AVAILABLE|LIMITED|UNAVAILABLE)$")
+    xray: str | None = Field(default=None, pattern="^(AVAILABLE|LIMITED|UNAVAILABLE)$")
+    ultrasound: str | None = Field(default=None, pattern="^(AVAILABLE|LIMITED|UNAVAILABLE)$")
+    medicines: list[dict] | None = None
+    specialists: list[dict] | None = None
+    workload_level: str | None = Field(default=None, pattern="^(LOW|MODERATE|HIGH)$")
 
 
 class RecommendRequest(BaseModel):
@@ -437,13 +437,13 @@ class AppointmentCreate(BaseModel):
     date: date
     time: str = "09:00"
     purpose: str = "General OPD"
-    appointment_type: str = "OPD"
+    appointment_type: str = Field(default="OPD", pattern="^(OPD|TELE|FOLLOWUP)$")
 
 
 class AppointmentUpdate(BaseModel):
-    status: str | None = None
-    queue_pos: int | None = None
-    notes: str | None = None
+    status: str | None = Field(default=None, pattern="^(SCHEDULED|IN_QUEUE|COMPLETED|CANCELLED)$")
+    queue_pos: int | None = Field(default=None, ge=1, le=1000)
+    notes: str | None = Field(default=None, max_length=1000)
 
 
 class AppointmentOut(ORM):
@@ -460,6 +460,42 @@ class AppointmentOut(ORM):
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# --------------------------------------------------------------- clinical queue
+
+class QueueItemOut(BaseModel):
+    """Stable, documented shape for GET /clinical/queue (never ad-hoc)."""
+
+    id: str
+    patient_id: str
+    patient_name: str
+    age: int = 0
+    sex: str = ""
+    phone: str = ""
+    village: str = ""
+    queue_status: str = Field(pattern="^(WAITING|IN_PROGRESS|COMPLETED|CANCELLED)$")
+    priority: str = Field(pattern="^(CRITICAL|HIGH|MEDIUM|LOW)$")
+    priority_score: int = 0
+    triage_level: str = ""
+    arrival_time: datetime
+    scheduled_time: datetime
+    waiting_minutes: int = 0
+    assigned_facility_id: str = ""
+    assigned_clinician_id: str = ""
+    referral_id: str | None = None
+    reason: str = ""
+    source: str = Field(pattern="^(appointment|referral)$")
+
+
+class QueueResponse(BaseModel):
+    items: list[QueueItemOut]
+    total: int
+    limit: int
+    offset: int
+    generated_at: datetime
+    facility_id: str | None = None
+    role: str = ""
 
 
 class TeleCreate(BaseModel):

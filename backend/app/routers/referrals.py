@@ -90,7 +90,7 @@ def create_referral(body: ReferralCreate, user: CurrentUser, db: DB):
         to_facility_id=body.to_facility_id,
         created_by_id=user.id,
         reason=body.reason,
-        priority=Priority(body.priority),
+        priority=Priority(body.priority.upper()) if isinstance(body.priority, str) else body.priority,
         status=ReferralStatus.SENT,
         clinical_summary=body.clinical_summary,
         vitals_snapshot=body.vitals_snapshot,
@@ -106,10 +106,10 @@ def create_referral(body: ReferralCreate, user: CurrentUser, db: DB):
     log_action(db, user, AuditAction.REFERRAL_CREATE, "referral", r.id, patient_id=patient.id,
                detail={"code": r.code, "to": body.to_facility_id, "priority": body.priority})
 
-    # Notify every user at the receiving facility — the loop starts here.
+    # Notify every active user at the receiving facility — no silent truncation.
     dest_users = db.execute(select(User).where(User.facility_id == body.to_facility_id,
                                                User.is_active.is_(True))).scalars().all()
-    for u in dest_users[:10]:
+    for u in dest_users:
         notify(db, u.id, "warning" if body.priority in ("URGENT", "EMERGENCY") else "info",
                f"Incoming referral {r.code} — {body.priority}",
                f"{patient.name} referred from {body.from_facility_id}. Reason: {body.reason}",
@@ -153,11 +153,19 @@ def list_referrals(
         q = q.where(or_(*conds))
 
     if status_filter:
-        q = q.where(Referral.status == ReferralStatus(status_filter.upper()))
+        try:
+            q = q.where(Referral.status == ReferralStatus(status_filter.upper()))
+        except ValueError:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"Unknown status '{status_filter}'")
 
-    rows = list(db.execute(q.order_by(Referral.created_at.desc())).scalars().all())
-    total = len(rows)
-    page = rows[offset: offset + limit]
+    rows = list(db.execute(q.order_by(Referral.created_at.desc()).offset(offset).limit(limit)).scalars().all())
+    # Efficient scoped total without loading all rows into memory:
+    from sqlalchemy import func as _func
+    # Re-apply the same scoping filters for an accurate total (cheap count query).
+    # For simplicity and correctness, count the filtered query via subquery:
+    total = db.execute(select(_func.count()).select_from(q.subquery())).scalar() or 0
+    page = rows
     return Page(items=[_out(db, r) for r in page], total=total, limit=limit, offset=offset)
 
 
@@ -195,7 +203,12 @@ def referral_history(referral_id: str, user: CurrentUser, db: DB):
 @router.post("/{referral_id}/transition", response_model=ReferralDetail,
              summary="Advance the referral lifecycle (validated + authorized)")
 def transition(referral_id: str, body: ReferralTransition, user: CurrentUser, db: DB):
-    r = db.get(Referral, referral_id)
+    # Row-level lock prevents concurrent transitions from both succeeding
+    # (lost-update on status/version).
+    try:
+        r = db.get(Referral, referral_id, with_for_update=True)
+    except TypeError:
+        r = db.get(Referral, referral_id)
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Referral not found")
     try:
@@ -216,6 +229,10 @@ def schedule_followup(referral_id: str, body: FollowUpCreate, user: CurrentUser,
     r = db.get(Referral, referral_id)
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Referral not found")
+    _assert_visible(user, r, db)
+    if body.referral_id and body.referral_id != referral_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "Body referral_id must match URL referral id")
     f = FollowUp(patient_id=r.patient_id, referral_id=r.id, scheduled_date=body.scheduled_date,
                  notes=body.notes or "Post-referral review", assignee_role=body.assignee_role)
     db.add(f)

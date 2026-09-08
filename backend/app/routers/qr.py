@@ -34,18 +34,14 @@ def get_patient_qr_info(patient_id: str, db: Session = Depends(get_db)):
             detail="Patient not found"
         )
     
-    # Return only basic, non-sensitive information
+    # Return only basic, non-sensitive information.
+    # Phone numbers, emergency contacts, blood group, conditions and allergies
+    # are PHI and must never be exposed on a public endpoint.
     return {
         "id": patient.id,
         "rak_id": patient.rak_id,
         "name": patient.name,
         "age": patient.age,
-        "gender": patient.gender,
+        "gender": patient.gender.value if hasattr(patient.gender, "value") else patient.gender,
         "village": patient.village,
-        "phone": patient.phone,
-        "emergency_contact": patient.emergency_contact,
-        "emergency_phone": patient.emergency_phone,
-        "blood_group": patient.blood_group,
-        "conditions": patient.conditions,  # Known conditions are useful for emergency care
-        "allergies": patient.allergies,    # Allergies are critical for emergency care
     }

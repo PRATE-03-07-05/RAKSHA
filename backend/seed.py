@@ -23,9 +23,14 @@ def d(days: int, hours: int = 0) -> datetime:
 
 
 def main() -> None:
+    import os
+    if os.environ.get("RAKSHA_SEED_DEMO", "false").lower() != "true" and os.environ.get("ENVIRONMENT", "development").lower() == "production":
+        print("[seed] refusing to seed demo users in production (set RAKSHA_SEED_DEMO=true to override).")
+        return
     db = SessionLocal()
     if db.query(User).first() is not None:
         print("[seed] already seeded — skipping.")
+        db.close()
         return
 
     pw = hash_password("raksha123")
@@ -286,15 +291,49 @@ def main() -> None:
                     notes="Diabetic foot review — patient missed visit", assignee_role="ASHA"))
 
     # ------------------------------------------------------------ appointments
-    db.add(Appointment(patient_id="p-06", facility_id="F-PHC-01", doctor_id="u-phcdr",
+    # Queue demo set (idempotent fixed ids): covers CRITICAL/HIGH/MEDIUM/LOW
+    # across PHC, CHC and Specialist scopes with staggered waiting times.
+    db.add(Appointment(id="ap-phc-1", patient_id="p-06", facility_id="F-PHC-01", doctor_id="u-phcdr",
                        date=date.today(), time="09:30", purpose="Antenatal check",
                        appointment_type=AppointmentType.OPD, status=AppointmentStatus.IN_QUEUE, queue_pos=1))
-    db.add(Appointment(patient_id="p-07", facility_id="F-PHC-01", doctor_id="u-phcdr",
+    db.add(Appointment(id="ap-phc-2", patient_id="p-07", facility_id="F-PHC-01", doctor_id="u-phcdr",
                        date=date.today(), time="10:00", purpose="Fever",
                        appointment_type=AppointmentType.OPD, status=AppointmentStatus.SCHEDULED, queue_pos=2))
-    db.add(Appointment(patient_id="p-sita", facility_id="F-CHC-01", doctor_id="u-chcdr",
+    db.add(Appointment(id="ap-chc-1", patient_id="p-sita", facility_id="F-CHC-01", doctor_id="u-chcdr",
                        date=date.today(), time="11:00", purpose="Referred case review",
                        appointment_type=AppointmentType.FOLLOWUP, status=AppointmentStatus.SCHEDULED, queue_pos=1))
+    db.add(Appointment(id="ap-dh-1", patient_id="p-04", facility_id="F-DH-01", doctor_id="u-specialist",
+                       date=date.today(), time="09:00", purpose="Cardiology review — suspected cardiac event",
+                       appointment_type=AppointmentType.OPD, status=AppointmentStatus.IN_QUEUE, queue_pos=1))
+    # Queue triage levels (latest assessment per patient drives queue priority).
+    db.add_all([
+        Assessment(id="q-a-02", patient_id="p-02", level=RiskLevel.HIGH, score=44,
+                   factors=[{"code": "CHRONIC", "label": "Diabetes with foot ulcer", "weight": 16}],
+                   red_flags=[], recommendation="URGENT_REFERRAL",
+                   rule_version="respiratory-v1.2", input_snapshot={"age": 58},
+                   created_at=d(-3, 1)),
+        Assessment(id="q-a-04", patient_id="p-04", level=RiskLevel.CRITICAL, score=70,
+                   factors=[{"code": "CHEST_PAIN", "label": "Chest pain reported", "weight": 25}],
+                   red_flags=["Chest pain reported"],
+                   recommendation="EMERGENCY_REFERRAL",
+                   rule_version="respiratory-v1.2", input_snapshot={"age": 67},
+                   created_at=d(0, -7)),
+        Assessment(id="q-a-03", patient_id="p-03", level=RiskLevel.MEDIUM, score=22,
+                   factors=[{"code": "PREGNANCY", "label": "High-risk pregnancy", "weight": 10}],
+                   red_flags=[], recommendation="PHC_EVALUATION",
+                   rule_version="respiratory-v1.2", input_snapshot={"age": 29},
+                   created_at=d(-4)),
+        Assessment(id="q-a-06", patient_id="p-06", level=RiskLevel.MEDIUM, score=18,
+                   factors=[{"code": "TEMP_HIGH", "label": "Fever reported", "weight": 15}],
+                   red_flags=[], recommendation="PHC_EVALUATION",
+                   rule_version="respiratory-v1.2", input_snapshot={"age": 34},
+                   created_at=d(0, -3)),
+        Assessment(id="q-a-07", patient_id="p-07", level=RiskLevel.LOW, score=5,
+                   factors=[{"code": "NO_RISK_SIGNALS", "label": "No red flags", "weight": 0}],
+                   red_flags=[], recommendation="HOME_CARE_ADVICE",
+                   rule_version="respiratory-v1.2", input_snapshot={"age": 12},
+                   created_at=d(0, -2)),
+    ])
 
     # ----------------------------------------------------------- notifications
     db.add_all([
@@ -317,9 +356,10 @@ def main() -> None:
 
     db.commit()
     print("[seed] RAKSHA demo data ready.")
-    print("[seed] Login demo accounts (password: raksha123):")
+    print("[seed] Login demo accounts (password: raksha123 — DEMO ONLY, change in production):")
     for u in ("patient", "asha", "anm", "phc.staff", "phc.doctor", "chc.doctor", "specialist", "admin"):
         print(f"        {u}@raksha.demo")
+    db.close()
 
 
 if __name__ == "__main__":

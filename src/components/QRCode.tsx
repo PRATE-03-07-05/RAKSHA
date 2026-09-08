@@ -25,6 +25,7 @@ export function QRCode({ value, size = 200, label, errorCorrectionLevel = "M" }:
       setError("No value provided");
       return;
     }
+    setError(null);
 
     QRCodeLib.toDataURL(value, {
       width: size,
@@ -35,7 +36,7 @@ export function QRCode({ value, size = 200, label, errorCorrectionLevel = "M" }:
         light: "#ffffff",
       },
     })
-      .then(setDataUrl)
+      .then((url) => { setDataUrl(url); setError(null); })
       .catch((err) => {
         console.error("QR code generation error:", err);
         setError("Failed to generate QR code");

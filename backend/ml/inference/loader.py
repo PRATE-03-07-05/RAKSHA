@@ -165,7 +165,13 @@ def predict_record(record: dict[str, Any], top_k: int = 5) -> MLResult:
     frame = build_feature_frame(record)
     pipeline = artifact["pipeline"]
     proba = pipeline.predict_proba(frame)[0]
-    classes = list(artifact.get("classes", CLASS_NAMES))
+    # Source of truth for label order is the fitted classifier's classes_,
+    # NOT the stored CLASS_NAMES order (sklearn sorts classes alphabetically).
+    try:
+        clf = pipeline.named_steps["clf"]
+        classes = list(getattr(clf, "classes_", artifact.get("classes", CLASS_NAMES)))
+    except Exception:
+        classes = list(artifact.get("classes", CLASS_NAMES))
     best = int(np.argmax(proba))
     predicted = classes[best]
 

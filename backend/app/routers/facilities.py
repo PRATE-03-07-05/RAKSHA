@@ -38,7 +38,11 @@ def list_facilities(_: CurrentUser, db: DB,
     if district:
         q = q.where(Facility.district == district)
     if facility_type:
-        q = q.where(Facility.facility_type == FacilityType(facility_type.upper()))
+        try:
+            q = q.where(Facility.facility_type == FacilityType(facility_type.upper()))
+        except ValueError:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"Unknown facility type '{facility_type}'")
     return [FacilityOut.model_validate(f) for f in db.execute(q).scalars()]
 
 
@@ -71,12 +75,32 @@ def update_resources(facility_id: str, body: FacilityResourceUpdate, user: Curre
     r = db.get(FacilityResource, facility_id)
     if r is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No resource record — run seed.py")
+    from ..models import ResourceAvailability as _RA
     for field in ("total_beds", "available_beds", "icu_beds", "oxygen_available", "ambulance_available",
-                  "emergency_available", "cbc", "xray", "ultrasound", "medicines", "specialists",
-                  "workload_level"):
+                  "emergency_available", "workload_level"):
         value = getattr(body, field)
         if value is not None:
             setattr(r, field, value)
+    for field in ("cbc", "xray", "ultrasound"):
+        value = getattr(body, field)
+        if value is not None:
+            try:
+                setattr(r, field, _RA(value))
+            except ValueError:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    f"Invalid {field} '{value}'")
+    if body.medicines is not None:
+        for m in body.medicines:
+            if not isinstance(m, dict) or "name" not in m:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "Each medicine must be an object with at least 'name'")
+        r.medicines = body.medicines
+    if body.specialists is not None:
+        for s in body.specialists:
+            if not isinstance(s, dict):
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "Each specialist must be an object")
+        r.specialists = body.specialists
     r.version += 1
     r.updated_by = user.name
     log_action(db, user, AuditAction.RESOURCE_UPDATE, "facility_resource", facility_id,
@@ -117,25 +141,28 @@ def recommend(body: RecommendRequest, _: CurrentUser, db: DB):
 
         if res:
             need("oxygen" in body.needs, res.oxygen_available, "Oxygen available", "No oxygen supply", 15, 25)
-            need("icu" in body.needs, res.icu_beds > 0, f"ICU beds: {res.icu_beds}", "No ICU beds", 15, 25)
+            need("icu" in body.needs, (res.icu_beds or 0) > 0, f"ICU beds: {res.icu_beds}", "No ICU beds", 15, 25)
             need("emergency" in body.needs, res.emergency_available, "Emergency department open",
                  "No emergency service", 12, 20)
-            need("cbc" in body.needs, res.cbc.value == "AVAILABLE", "CBC lab available", "CBC unavailable", 6, 10)
-            need("xray" in body.needs, res.xray.value == "AVAILABLE", "X-Ray available", "X-Ray unavailable", 6, 10)
-            need("ultrasound" in body.needs, res.ultrasound.value == "AVAILABLE", "Ultrasound available",
+            def _avail(v) -> str:
+                return v.value if hasattr(v, "value") else str(v)
+            need("cbc" in body.needs, _avail(res.cbc) == "AVAILABLE", "CBC lab available", "CBC unavailable", 6, 10)
+            need("xray" in body.needs, _avail(res.xray) == "AVAILABLE", "X-Ray available", "X-Ray unavailable", 6, 10)
+            need("ultrasound" in body.needs, _avail(res.ultrasound) == "AVAILABLE", "Ultrasound available",
                  "Ultrasound unavailable", 6, 10)
             specialties = [s for s in body.needs if s.startswith("specialty:")]
             for sp in specialties:
                 name = sp.split(":", 1)[1].lower()
-                has = any(str(s.get("specialty", "")).lower() == name and s.get("available") for s in res.specialists)
+                spec_list = res.specialists if isinstance(res.specialists, list) else []
+                has = any(isinstance(s, dict) and str(s.get("specialty", "")).lower() == name and s.get("available") for s in spec_list)
                 need(True, has, f"{name.title()} specialist available", f"No {name} specialist", 15, 15)
-            if res.available_beds <= 0:
+            if (res.available_beds or 0) <= 0:
                 score -= 30
                 reasons.append("No beds currently free")
-            elif res.available_beds < 5:
+            elif (res.available_beds or 0) < 5:
                 score -= 10
                 reasons.append(f"Only {res.available_beds} beds free")
-            load = res.workload_level
+            load = res.workload_level if isinstance(res.workload_level, str) else str(res.workload_level or "UNKNOWN")
             if load == "LOW":
                 score += 10
                 reasons.append("Low current workload")

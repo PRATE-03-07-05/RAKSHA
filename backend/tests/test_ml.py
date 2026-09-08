@@ -102,7 +102,9 @@ def test_inference_with_real_artifact():
         pipe = build_pipeline(RandomForestClassifier(n_estimators=40, random_state=0))
         pipe.fit(X, y)
         joblib.dump({
-            "pipeline": pipe, "classes": list(np.unique(y)) or CLASS_NAMES,
+            # Store prod CLASS_NAMES order (LOW,MEDIUM,HIGH,CRITICAL), NOT
+            # alphabetical — inference must follow clf.classes_, not this order.
+            "pipeline": pipe, "classes": list(CLASS_NAMES),
             "feature_names": FEATURE_NAMES, "model_name": "random_forest",
             "model_version": "test-tiny", "trained_at": "2026-01-01T00:00:00Z",
             "dataset": {"source": "unit-test", "rows": n, "seed": rng_seed},

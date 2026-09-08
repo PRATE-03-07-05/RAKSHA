@@ -4,7 +4,7 @@
  */
 import React, { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { User, Phone, MapPin, Heart, AlertTriangle, ArrowLeft, Loader2 } from "lucide-react";
+import { User, MapPin, AlertTriangle, ArrowLeft } from "lucide-react";
 import { Card, Btn, Banner, Spinner, EmptyState } from "../components/ui";
 import { rq } from "../lib/http";
 
@@ -15,12 +15,6 @@ interface PatientQRInfo {
   age: number;
   gender: string;
   village: string;
-  phone: string;
-  emergency_contact: string;
-  emergency_phone: string;
-  blood_group: string | null;
-  conditions: string[];
-  allergies: string[];
 }
 
 export function QRPatientPage() {
@@ -36,8 +30,8 @@ export function QRPatientPage() {
       return;
     }
 
-    // Fetch patient info from public QR endpoint (no authentication required)
-    rq<PatientQRInfo>("GET", `/qr/patient/${patientId}`)
+    // Public endpoint: must not clear the session on 401.
+    rq<PatientQRInfo>("GET", `/qr/patient/${patientId}`, { public: true })
       .then((data) => {
         setPatient(data);
         setLoading(false);
@@ -118,13 +112,7 @@ export function QRPatientPage() {
                 <div className="flex flex-wrap gap-3 mt-2 text-sm text-slate-600">
                   <span>{patient.age} years</span>
                   <span>•</span>
-                  <span className="capitalize">{patient.gender.toLowerCase()}</span>
-                  {patient.blood_group && (
-                    <>
-                      <span>•</span>
-                      <span className="font-semibold">{patient.blood_group}</span>
-                    </>
-                  )}
+                  <span className="capitalize">{(patient.gender ?? "").toLowerCase()}</span>
                 </div>
               </div>
             </div>
@@ -134,76 +122,6 @@ export function QRPatientPage() {
               <MapPin className="h-4 w-4 text-slate-400" />
               <span className="text-slate-600">{patient.village}</span>
             </div>
-
-            {/* Contact */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 text-sm">
-                <Phone className="h-4 w-4 text-slate-400" />
-                <span className="text-slate-600">{patient.phone || "No phone number"}</span>
-              </div>
-            </div>
-
-            {/* Emergency Contact */}
-            <div className="rounded-lg bg-amber-50 border border-amber-200 p-4">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
-                <div className="flex-1">
-                  <h3 className="font-semibold text-amber-900 text-sm">
-                    Emergency Contact
-                  </h3>
-                  <p className="text-sm text-amber-800 mt-1">
-                    {patient.emergency_contact}
-                  </p>
-                  <p className="text-sm text-amber-700">
-                    {patient.emergency_phone}
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Medical Conditions */}
-            {patient.conditions.length > 0 && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <Heart className="h-4 w-4 text-slate-400" />
-                  <h3 className="font-semibold text-brand-950 text-sm">
-                    Known Conditions
-                  </h3>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {patient.conditions.map((condition, idx) => (
-                    <span
-                      key={idx}
-                      className="rounded-full bg-brand-50 border border-brand-200 px-3 py-1 text-xs font-medium text-brand-800"
-                    >
-                      {condition}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Allergies */}
-            {patient.allergies.length > 0 && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <AlertTriangle className="h-4 w-4 text-rose-500" />
-                  <h3 className="font-semibold text-rose-900 text-sm">
-                    Allergies
-                  </h3>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {patient.allergies.map((allergy, idx) => (
-                    <span
-                      key={idx}
-                      className="rounded-full bg-rose-50 border border-rose-200 px-3 py-1 text-xs font-medium text-rose-800"
-                    >
-                      {allergy}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
         </Card>
 

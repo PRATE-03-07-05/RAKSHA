@@ -1,17 +1,17 @@
 /** Clinical workspace — PHC doctor, CHC doctor, specialist. */
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   Stethoscope, ListOrdered, HeartPulse, Siren, ArrowRight, Users, ChevronRight,
   CheckCircle2, Clock3, AlertTriangle, FileText, PlusCircle, Trash2, Send,
-  ShieldAlert, Video, KeyRound, Activity, CalendarClock,
+  ShieldAlert, Video, KeyRound, Activity, CalendarClock, RefreshCw,
 } from "lucide-react";
-import { api, getDB, facilityName, nextStatuses, isOverdue, followUpState, REF_FLOW } from "../store/backend";
+import { api, getDB, facilityName, nextStatuses, isOverdue, followUpState, REF_FLOW, ApiError } from "../store/backend";
 import { useAuth, useApi, useI18n, useToast } from "../store/providers";
 import { Card, StatCard, Pill, RiskBadge, RefStatusBadge, Btn, Spinner, EmptyState, Field, Input, Select, Textarea, Modal, Banner, KV, Avatar, SectionHead, Progress } from "../components/ui";
 import { PatientRecordPage } from "./RecordPages";
 import { ReferralPanel } from "./FieldWorker";
-import type { Assessment, Referral, RefStatus, Patient } from "../lib/types";
+import type { Assessment, Referral, RefStatus, Patient, ClinicalQueueItem } from "../lib/types";
 import { fmtD, fmtDT, fmtTime, relTime, todayISO, cx } from "../lib/utils";
 
 const isClinical = (role?: string) => role === "PHC_DOCTOR" || role === "CHC_DOCTOR" || role === "SPECIALIST";
@@ -36,7 +36,10 @@ export function DoctorDashboard() {
     const inDept = incoming.filter(r => ["ARRIVED", "IN_CONSULTATION", "TREATMENT"].includes(r.status));
     const queue = (apQ.data ?? []).filter(a => a.date === today && a.status !== "COMPLETED" && a.status !== "CANCELLED");
     const latestByPatient = new Map<string, Assessment>();
-    db.assessments.forEach(a => { if (!latestByPatient.has(a.patientId)) latestByPatient.set(a.patientId, a); });
+    db.assessments.forEach(a => {
+      const cur = latestByPatient.get(a.patientId);
+      if (!cur || a.ts > cur.ts) latestByPatient.set(a.patientId, a);
+    });
     const highRisk = [...latestByPatient.values()].filter(a => a.level === "HIGH" || a.level === "CRITICAL").slice(0, 5);
     const activeEmg = (emgQ.data ?? []).filter(e => e.status === "ACTIVE");
     return { incoming, waiting, inDept, queue, highRisk, activeEmg };
@@ -121,61 +124,142 @@ function StatusLegend() {
 }
 
 /* ------------------------------------------------------------------ queue */
+/* Canonical Patient Queue — single source: GET /clinical/queue (PostgreSQL).
+   Backend owns ordering (priority → waiting time → id); frontend never
+   re-sorts authoritatively (visual filter only). Explicit states:
+   LOADING / SUCCESS / EMPTY / ERROR / UNAUTHORIZED. */
+
+type QueueState =
+  | { kind: "loading" }
+  | { kind: "data"; items: ClinicalQueueItem[]; total: number; generatedAt: number }
+  | { kind: "empty"; generatedAt: number }
+  | { kind: "error"; message: string }
+  | { kind: "unauthorized"; message: string };
 
 export function QueuePage() {
   const { user } = useAuth();
   const { t } = useI18n();
-  const apQ = useApi(() => api.listAppointments(user as never), [user?.id]);
-  const refQ = useApi(() => api.listReferrals(user as never), [user?.id]);
-  const today = todayISO();
-  
-  if (apQ.loading || refQ.loading) return <Spinner label={t("loading")} />;
-  if (apQ.error || refQ.error) {
-    return <EmptyState title="Failed to load patient queue" hint={apQ.error || refQ.error || "Unknown error"} />;
-  }
+  const [state, setState] = useState<QueueState>({ kind: "loading" });
+  const [priorityFilter, setPriorityFilter] = useState<string>("ALL");
+  const seqRef = useRef(0);
+  const userId = user?.id;
+  const userRole = user?.role;
+  const userFacility = user?.facilityId;
 
-  const rows = useMemo(() => {
-    const db = getDB();
-    const items: { id: string; patient: Patient; source: string; priority: string; since: number; kind: "appointment" | "referral"; refId?: string }[] = [];
-    (apQ.data ?? []).filter(a => a.date === today && a.status !== "COMPLETED" && a.status !== "CANCELLED").forEach(a => {
-      const p = db.patients.find(x => x.id === a.patientId);
-      if (p) items.push({ id: a.id, patient: p, source: `OPD · ${a.purpose}`, priority: a.status === "IN_QUEUE" ? `Queue #${a.queuePos}` : a.status, since: new Date(`${a.date}T${a.time}:00`).getTime(), kind: "appointment" });
-    });
-    (refQ.data ?? []).filter(r => r.toFacilityId === user?.facilityId && ["ARRIVED", "IN_CONSULTATION", "TREATMENT"].includes(r.status)).forEach(r => {
-      const p = db.patients.find(x => x.id === r.patientId);
-      if (p && !items.some(i => i.patient.id === p.id)) items.push({ id: r.id, patient: p, source: `Referral · ${facilityName(r.fromFacilityId)}`, priority: r.priority, since: r.ts, kind: "referral", refId: r.id });
-    });
-    return items.sort((a, b) => a.since - b.since);
-  }, [apQ.data, refQ.data, user?.facilityId, today]);
+  const load = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!user) { setState({ kind: "unauthorized", message: "Sign in required." }); return; }
+    const seq = ++seqRef.current;
+    if (!opts?.silent) setState({ kind: "loading" });
+    const ctrl = new AbortController();
+    try {
+      const res = await api.getClinicalQueue(user as never, { limit: 50 }, ctrl.signal);
+      if (seqRef.current !== seq) return; // stale response: never overwrite newer data
+      if (res.items.length === 0) setState({ kind: "empty", generatedAt: res.generatedAt });
+      else setState({ kind: "data", items: res.items, total: res.total, generatedAt: res.generatedAt });
+    } catch (e) {
+      if (seqRef.current !== seq) return;
+      if (e instanceof ApiError && e.status === 401) {
+        setState({ kind: "unauthorized", message: "Session expired — sign in again." });
+      } else if (e instanceof ApiError && e.status === 403) {
+        setState({ kind: "unauthorized", message: "Your role is not permitted to view the clinical queue." });
+      } else {
+        setState({ kind: "error", message: e instanceof Error ? e.message : "Failed to load queue." });
+      }
+    } finally {
+      ctrl.abort();
+    }
+  }, [user]);
+
+  // Stable primitive deps — user object identity never triggers refetch loops.
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, userRole, userFacility]);
+
+  // Conservative auto-refresh (30s); manual Refresh triggers exactly one request.
+  useEffect(() => {
+    const iv = window.setInterval(() => void load({ silent: true }), 30000);
+    return () => window.clearInterval(iv);
+  }, [load]);
+
+  const visible = state.kind === "data"
+    ? state.items.filter(i => priorityFilter === "ALL" || i.priority === priorityFilter)
+    : [];
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
-      <SectionHead kicker="Today" title={t("patientQueue")} right={<Pill tone="brand">{rows.length} waiting</Pill>} />
-      {rows.length === 0 && <EmptyState icon={<ListOrdered className="h-8 w-8" />} title="Queue is clear" hint="Appointments and arrived referrals for today appear here." />}
+      <SectionHead
+        kicker="Today"
+        title={t("patientQueue")}
+        right={
+          <div className="flex items-center gap-2">
+            {state.kind === "data" && <Pill tone="brand">{state.total} waiting</Pill>}
+            <Select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)} aria-label="Filter by priority">
+              <option value="ALL">All priorities</option>
+              <option value="CRITICAL">CRITICAL</option>
+              <option value="HIGH">HIGH</option>
+              <option value="MEDIUM">MEDIUM</option>
+              <option value="LOW">LOW</option>
+            </Select>
+            <Btn size="sm" variant="secondary" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" /> Refresh</Btn>
+          </div>
+        }
+      />
+      {state.kind === "loading" && <Spinner label={t("loading")} />}
+      {state.kind === "empty" && (
+        <EmptyState icon={<ListOrdered className="h-8 w-8" />} title="No patients currently waiting"
+          hint="The queue is empty — new appointments and referrals will appear here automatically." />
+      )}
+      {state.kind === "unauthorized" && (
+        <Banner tone="warning">{state.message}</Banner>
+      )}
+      {state.kind === "error" && (
+        <Card>
+          <p className="text-sm font-bold text-rose-700">Queue failed to load</p>
+          <p className="mt-1 text-xs text-slate-500">{state.message}</p>
+          <div className="mt-3"><Btn size="sm" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" /> Retry</Btn></div>
+        </Card>
+      )}
+      {state.kind === "data" && visible.length === 0 && (
+        <EmptyState title="No matches for this filter" hint="Clear the priority filter to see the full queue." />
+      )}
+      {state.kind === "data" && (
+        <p className="text-[11px] text-slate-400">
+          Backend-ordered by clinical priority → waiting time. Updated {relTime(state.generatedAt)}.
+        </p>
+      )}
       <div className="space-y-2">
-        {rows.map((row, i) => {
-          const wait = Math.max(0, Math.round((Date.now() - row.since) / 60000));
-          return (
-            <Card key={row.id}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <span className="font-display w-8 text-center text-xl font-extrabold text-brand-300">{i + 1}</span>
-                  <Avatar name={row.patient.name} />
-                  <div>
-                    <p className="text-sm font-bold text-brand-950">{row.patient.name} <span className="font-mono text-[10px] text-brand-500">{row.patient.rakId}</span></p>
-                    <p className="text-[11px] text-slate-500">{row.source} · {row.patient.age}y · {row.patient.conditions.join(", ") || "no known conditions"}</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Pill tone={row.priority === "EMERGENCY" || row.priority === "URGENT" ? "red" : row.priority === "PRIORITY" ? "amber" : "slate"}>{row.priority}</Pill>
-                  <span className="inline-flex items-center gap-1 font-mono text-[11px] font-bold text-slate-400"><Clock3 className="h-3.5 w-3.5" /> {wait}m</span>
-                  <Link to={`/app/patients/${row.patient.id}`}><Btn size="sm" variant="secondary">{t("viewRecord")} <ArrowRight className="h-3.5 w-3.5" /></Btn></Link>
+        {visible.map((row, i) => (
+          <Card key={row.id}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="font-display w-8 text-center text-xl font-extrabold text-brand-300">{i + 1}</span>
+                <Avatar name={row.patientName} />
+                <div>
+                  <p className="text-sm font-bold text-brand-950">{row.patientName}</p>
+                  <p className="text-[11px] text-slate-500">
+                    {row.source === "referral" ? `Referral · ${row.reason}` : row.reason}
+                    {` · ${row.age}y`} {row.village ? ` · ${row.village}` : ""}
+                  </p>
+                  <p className="font-mono text-[10px] text-slate-400">
+                    {row.queueStatus.replace("_", " ")} · {row.source}
+                    {row.referralId ? ` · ${row.referralId.slice(0, 8)}` : ""}
+                  </p>
                 </div>
               </div>
-            </Card>
-          );
-        })}
+              <div className="flex items-center gap-2">
+                <RiskBadge level={row.priority} />
+                <Pill tone={row.queueStatus === "IN_PROGRESS" ? "amber" : "sky"}>{row.queueStatus.replace("_", " ")}</Pill>
+                <span className="inline-flex items-center gap-1 font-mono text-[11px] font-bold text-slate-400">
+                  <Clock3 className="h-3.5 w-3.5" /> {row.waitingMinutes}m
+                </span>
+                <Link to={`/app/patients/${row.patientId}`}><Btn size="sm" variant="secondary">{t("viewRecord")} <ArrowRight className="h-3.5 w-3.5" /></Btn></Link>
+              </div>
+            </div>
+          </Card>
+        ))}
       </div>
+      <p className="text-[11px] text-slate-400">Queue-management ordering only — AI-assisted triage remains decision support, not a diagnosis.</p>
     </div>
   );
 }
@@ -284,12 +368,21 @@ export function ReferralDetailPage() {
   };
 
   if (refQ.loading) return <Spinner label={t("loading")} />;
-  if (!r || !p) return <EmptyState title="Referral not found" action={<Link to="/app/referrals"><Btn size="sm" variant="secondary">{t("back")}</Btn></Link>} />;
+  if (!r) return <EmptyState title="Referral not found" action={<Link to="/app/referrals"><Btn size="sm" variant="secondary">{t("back")}</Btn></Link>} />;
+  if (!p) return (
+    <div className="mx-auto max-w-4xl space-y-4">
+      <Banner tone="warning">Referral {r.code} loaded, but patient record is not cached yet — retry when online.</Banner>
+      <EmptyState title="Patient record unavailable offline" action={<Link to="/app/referrals"><Btn size="sm" variant="secondary">{t("back")}</Btn></Link>} />
+    </div>
+  );
 
   const doneIdx = REF_FLOW.indexOf(r.status);
   const next = nextStatuses(r.status).filter(s => s !== "CANCELLED");
   const ACTION_LABEL: Record<string, string> = { ACKNOWLEDGED: t("acknowledge"), ACCEPTED: t("accept"), ARRIVED: t("markArrived"), IN_CONSULTATION: "Start consultation", TREATMENT: t("startTreatment"), COMPLETED: t("completeReferral") };
-  const canAct = user?.facilityId === r.toFacilityId && isClinical(user?.role) || (r.status === "ACCEPTED" && (user?.role === "ASHA" || user?.role === "ANM"));
+  const facilityMatch = user?.facilityId === r.toFacilityId;
+  const clinical = isClinical(user?.role);
+  const fieldArrival = r.status === "ACCEPTED" && (user?.role === "ASHA" || user?.role === "ANM");
+  const canAct = (facilityMatch && clinical) || fieldArrival;
   const overdue = isOverdue(r);
 
   return (
@@ -471,7 +564,7 @@ export function DoctorPatientPage() {
   const [emgOpen, setEmgOpen] = useState(false);
   const [emgNote, setEmgNote] = useState("");
   const [savingEmg, setSavingEmg] = useState(false);
-  const patQ = useApi(() => api.searchPatients(user as never, "").then(l => l.find(p => p.id === id) ?? null), [id]);
+  const patQ = useApi(() => (id ? api.getPatient(user as never, id).then(r => r.patient).catch(() => null) : Promise.resolve(null)), [id]);
   const clinical = isClinical(user?.role);
 
   const createEmg = async () => {
@@ -554,8 +647,14 @@ export function EmergencyPage() {
             <div className="mt-4 grid gap-3 lg:grid-cols-2">
               <div className="rounded-lg border border-dashed border-brand-300 bg-brand-50/50 p-3">
                 <p className="mb-2 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-brand-600"><KeyRound className="h-3.5 w-3.5" /> Controlled SMS fallback — prototype</p>
-                <p className="font-mono text-xs font-bold text-brand-900">EMERGENCY|{e.code}|{e.smsRedeemed ? "••••••" : e.smsToken}</p>
-                <p className="mt-1 text-[10px] text-slate-400">Expires {fmtTime(e.smsExpiresAt)} · {e.smsRedeemed ? "redeemed (replay blocked)" : "one-time token"}</p>
+                {e.smsToken ? (
+                  <>
+                    <p className="font-mono text-xs font-bold text-brand-900">EMERGENCY|{e.code}|{e.smsRedeemed ? "••••••" : "••••••"}</p>
+                    <p className="mt-1 text-[10px] text-slate-400">One-time token is SMS-only and never displayed here. Expires {fmtTime(e.smsExpiresAt)} · {e.smsRedeemed ? "redeemed (replay blocked)" : "one-time token"}</p>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-slate-500">One-time SMS token is only issued at creation and never listed — use the SMS channel to redeem.</p>
+                )}
                 {e.status === "ACTIVE" && (
                   <div className="mt-2 flex gap-2">
                     <Input className="py-1.5 font-mono uppercase" placeholder="Enter token" value={tokens[e.id] ?? ""} onChange={ev => setTokens(x => ({ ...x, [e.id]: ev.target.value }))} />
@@ -571,7 +670,7 @@ export function EmergencyPage() {
             </div>
             {e.status !== "RESOLVED" && (
               <div className="mt-3 flex justify-end">
-                <Btn size="sm" variant="secondary" onClick={() => { void api.resolveEmergency(user as never, e.id).then(() => toast("Emergency resolved.", "success")); }}><CheckCircle2 className="h-4 w-4" /> Mark resolved</Btn>
+                <Btn size="sm" variant="secondary" onClick={() => { void api.resolveEmergency(user as never, e.id).then(() => toast("Emergency resolved.", "success")).catch(err => toast(err instanceof Error ? err.message : "Failed", "error")); }}><CheckCircle2 className="h-4 w-4" /> Mark resolved</Btn>
               </div>
             )}
           </Card>

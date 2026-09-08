@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ..audit import AuditAction, log_action
 from ..database import get_db
 from ..models import (Appointment, AppointmentStatus, AppointmentType,
-                      Consultation, Patient, Role, Teleconsultation,
+                      Consultation, Facility, Patient, Role, Teleconsultation,
                       TeleStatus, User)
 from ..schemas import (AppointmentCreate, AppointmentOut, AppointmentUpdate,
                        TeleComplete, TeleCreate, TeleOut)
@@ -52,13 +52,24 @@ def _own_patient(user: User, db: Session, patient_id: str) -> Patient:
              summary="Book an appointment (patients book for themselves)")
 def create_appointment(body: AppointmentCreate, user: CurrentUser, db: DB):
     p = _own_patient(user, db, body.patient_id)
-    count = db.execute(select(Appointment).where(Appointment.facility_id == body.facility_id,
-                                                 Appointment.date == body.date,
-                                                 Appointment.status != AppointmentStatus.CANCELLED)).scalars().all()
+    if db.get(Facility, body.facility_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Facility not found")
+    if body.doctor_id and db.get(User, body.doctor_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Doctor not found")
+    try:
+        appt_type = AppointmentType(body.appointment_type)
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            f"Unknown appointment_type '{body.appointment_type}'")
+    from sqlalchemy import func as _func
+    max_q = db.execute(select(_func.max(Appointment.queue_pos)).where(
+        Appointment.facility_id == body.facility_id,
+        Appointment.date == body.date,
+        Appointment.status != AppointmentStatus.CANCELLED)).scalar()
     a = Appointment(patient_id=p.id, facility_id=body.facility_id, doctor_id=body.doctor_id,
                     date=body.date, time=body.time, purpose=body.purpose,
-                    appointment_type=AppointmentType(body.appointment_type),
-                    queue_pos=len(count) + 1)
+                    appointment_type=appt_type,
+                    queue_pos=(max_q or 0) + 1)
     db.add(a)
     db.flush()
     log_action(db, user, AuditAction.APPOINTMENT_CREATE, "appointment", a.id, patient_id=p.id,
@@ -91,6 +102,11 @@ def get_appointment(appointment_id: str, user: CurrentUser, db: DB):
         p = db.get(Patient, a.patient_id)
         if not p or p.user_id != user.id:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your appointment")
+    elif user.role != Role.DISTRICT_ADMIN and user.facility_id != a.facility_id:
+        # Staff may only view appointments at their own facility.
+        p = db.get(Patient, a.patient_id)
+        if not (p and p.asha_id == user.id):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your facility's appointment")
     return a
 
 
@@ -101,14 +117,30 @@ def update_appointment(appointment_id: str, body: AppointmentUpdate, user: Curre
     if a is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found")
 
-    if body.status:
-        target = AppointmentStatus(body.status)
-        if user.role == Role.PATIENT:
-            p = db.get(Patient, a.patient_id)
+    # Authorization applies to ALL updates (status, queue_pos, notes).
+    if user.role == Role.PATIENT:
+        p = db.get(Patient, a.patient_id)
+        if body.status:
+            try:
+                target = AppointmentStatus(body.status)
+            except ValueError:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    f"Unknown status '{body.status}'")
             if not p or p.user_id != user.id or target != AppointmentStatus.CANCELLED:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Patients can only cancel their own appointments")
-        elif user.role != Role.DISTRICT_ADMIN and user.facility_id != a.facility_id:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the hosting facility can change status")
+        elif not (p and p.user_id == user.id):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your appointment")
+        if body.queue_pos is not None or body.notes is not None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Patients cannot edit queue/notes")
+    elif user.role != Role.DISTRICT_ADMIN and user.facility_id != a.facility_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the hosting facility can update appointments")
+
+    if body.status:
+        try:
+            target = AppointmentStatus(body.status)
+        except ValueError:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"Unknown status '{body.status}'")
         if target not in _APPT_TRANSITIONS[a.status]:
             raise HTTPException(status.HTTP_409_CONFLICT,
                                 f"Invalid transition {a.status.value} → {target.value}")
@@ -128,6 +160,10 @@ def update_appointment(appointment_id: str, body: AppointmentUpdate, user: Curre
              summary="Schedule a teleconsultation session (metadata only)")
 def create_tele(body: TeleCreate, user: CurrentUser, db: DB):
     p = _own_patient(user, db, body.patient_id)
+    if db.get(User, body.doctor_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Doctor not found")
+    if body.facility_id and db.get(Facility, body.facility_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Facility not found")
     t = Teleconsultation(patient_id=p.id, doctor_id=body.doctor_id, facility_id=body.facility_id,
                          scheduled_at=body.scheduled_at, room_code=f"RAK-{secrets.token_hex(4).upper()}")
     db.add(t)
@@ -144,6 +180,8 @@ def list_teles(user: CurrentUser, db: DB):
         q = q.where(Teleconsultation.patient_id.in_(own))
     elif user.role in CLINICAL:
         q = q.where(Teleconsultation.doctor_id == user.id)
+    elif user.role != Role.DISTRICT_ADMIN and user.facility_id:
+        q = q.where(Teleconsultation.facility_id == user.facility_id)
     return [_tout(db, t) for t in db.execute(q).scalars()]
 
 
@@ -154,7 +192,7 @@ def complete_tele(tele_id: str, body: TeleComplete, user: CurrentUser, db: DB):
     t = db.get(Teleconsultation, tele_id)
     if t is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Teleconsultation not found")
-    if t.doctor_id != user.id and user.role != Role.SPECIALIST:
+    if t.doctor_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the consulting clinician can record the outcome")
     if t.status == TeleStatus.COMPLETED:
         raise HTTPException(status.HTTP_409_CONFLICT, "Already completed")

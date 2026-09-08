@@ -75,19 +75,19 @@ export default function App() {
             <Route path="assess" element={<Gate roles={FIELD}><AssessFlow /></Gate>} />
             <Route path="queue" element={<Gate roles={CLINICAL}><QueuePage /></Gate>} />
             <Route path="referrals" element={<ReferralsRouter />} />
-            <Route path="referrals/:id" element={<ReferralDetailPage />} />
-            <Route path="followups" element={<FollowUpsPage />} />
+            <Route path="referrals/:id" element={<Gate roles={[...FIELD, ...CLINICAL, "DISTRICT_ADMIN"]}><ReferralDetailPage /></Gate>} />
+            <Route path="followups" element={<Gate roles={[...FIELD, ...CLINICAL, "DISTRICT_ADMIN"]}><FollowUpsPage /></Gate>} />
             <Route path="tele" element={<Gate roles={["PATIENT", ...CLINICAL]}><TelePage /></Gate>} />
             <Route path="emergency" element={<Gate roles={[...CLINICAL, "DISTRICT_ADMIN"]}><EmergencyPage /></Gate>} />
             <Route path="appointments" element={<Gate roles={["PATIENT"]}><AppointmentsPage /></Gate>} />
-            <Route path="notifications" element={<NotificationsPage />} />
+            <Route path="notifications" element={<Gate><NotificationsPage /></Gate>} />
             <Route path="sync" element={<Gate roles={FIELD}><SyncCenterPage /></Gate>} />
             <Route path="facilities" element={<Gate roles={["DISTRICT_ADMIN"]}><FacilitiesPage /></Gate>} />
             <Route path="bottlenecks" element={<Gate roles={["DISTRICT_ADMIN"]}><BottleneckPage /></Gate>} />
             <Route path="audit" element={<Gate roles={["DISTRICT_ADMIN"]}><AuditPage /></Gate>} />
             <Route path="users" element={<Gate roles={["DISTRICT_ADMIN"]}><UserManagement /></Gate>} />
             <Route path="settings" element={<Gate roles={["DISTRICT_ADMIN"]}><SettingsPage /></Gate>} />
-            <Route path="profile" element={<ProfilePage />} />
+            <Route path="profile" element={<Gate><ProfilePage /></Gate>} />
           </Route>
           {/* Public QR code route - no authentication required */}
           <Route path="/qr/patient/:patientId" element={<QRPatientPage />} />

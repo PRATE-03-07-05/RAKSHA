@@ -107,7 +107,7 @@ def create_visit(patient_id: str, body: VisitCreate, user: CurrentUser, db: DB):
 def create_vitals(patient_id: str, body: VitalCreate, user: CurrentUser, db: DB):
     p = get_patient_or_404(db, patient_id)
     assert_can_view(user, p)
-    if all(v is None for v in (body.systolic, body.temperature, body.spo2, body.heart_rate,
+    if all(v is None for v in (body.systolic, body.diastolic, body.temperature, body.spo2, body.heart_rate,
                                body.respiratory_rate, body.weight_kg)):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "At least one vital measurement is required")
     o = VitalObservation(
@@ -133,6 +133,7 @@ def create_vitals(patient_id: str, body: VitalCreate, user: CurrentUser, db: DB)
              dependencies=[Depends(require_roles(*CLINICAL))])
 def create_consultation(patient_id: str, body: ConsultationCreate, user: CurrentUser, db: DB):
     p = get_patient_or_404(db, patient_id)
+    assert_can_view(user, p)
     c = Consultation(patient_id=p.id, doctor_id=user.id, facility_id=user.facility_id,
                      complaint=body.complaint, findings=body.findings, assessment=body.assessment,
                      plan=body.plan, investigation=body.investigation, follow_up_date=body.follow_up_date)
@@ -163,6 +164,7 @@ def create_consultation(patient_id: str, body: ConsultationCreate, user: Current
              dependencies=[Depends(require_roles(*CLINICAL, Role.PHC_STAFF))])
 def create_diagnostic(patient_id: str, body: DiagnosticCreate, user: CurrentUser, db: DB):
     p = get_patient_or_404(db, patient_id)
+    assert_can_view(user, p)
     d = DiagnosticRecord(patient_id=p.id, ordered_by_id=user.id,
                          facility_id=body.facility_id or user.facility_id,
                          test=body.test, status=body.status, result_text=body.result_text,
@@ -195,6 +197,7 @@ def list_patient_followups(patient_id: str, user: CurrentUser, db: DB):
              dependencies=[Depends(require_roles(*RECORDERS))])
 def create_followup(patient_id: str, body: FollowUpCreate, user: CurrentUser, db: DB):
     p = get_patient_or_404(db, patient_id)
+    assert_can_view(user, p)
     f = FollowUp(patient_id=p.id, referral_id=body.referral_id, scheduled_date=body.scheduled_date,
                  notes=body.notes, assignee_role=body.assignee_role)
     db.add(f)

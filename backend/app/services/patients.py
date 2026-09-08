@@ -36,11 +36,18 @@ def can_view(user: User, patient: Patient) -> bool:
 
 
 def search(db: Session, user: User, q: str, limit: int, offset: int) -> tuple[list[Patient], int]:
+    from sqlalchemy import func as _func
     base = select(Patient)
+    # Facility scoping for non-admin staff (prevents cross-facility enumeration).
+    if user.role not in (Role.DISTRICT_ADMIN, Role.PATIENT):
+        if user.role in (Role.ASHA, Role.ANM):
+            base = base.where((Patient.asha_id == user.id) | (Patient.phc_id == user.facility_id))
+        elif user.facility_id:
+            base = base.where(Patient.phc_id == user.facility_id)
     q = (q or "").strip()
     if q:
         like = f"%{q}%"
         base = base.where(or_(Patient.rak_id.ilike(like), Patient.name.ilike(like), Patient.phone.ilike(like)))
-    total = len(db.execute(base).scalars().all())
+    total = db.execute(select(_func.count()).select_from(base.subquery())).scalar() or 0
     rows = db.execute(base.order_by(Patient.created_at.desc()).limit(limit).offset(offset)).scalars().all()
     return list(rows), total

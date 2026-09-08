@@ -8,7 +8,7 @@ import {
 import { useAuth, useI18n, useToast } from "../store/providers";
 import { resetDB } from "../store/backend";
 import { Btn, Field, Input, Banner } from "../components/ui";
-import { LogoMark, AppShell } from "../components/shell";
+import { LogoMark } from "../components/shell";
 import { CareChain } from "./Landing";
 import type { Role } from "../lib/types";
 
@@ -39,7 +39,8 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
 
   const doLogin = async (em: string, pw: string) => {
-    setBusy(em); setError(null);
+    const key = em === email && pw === password ? "form" : em;
+    setBusy(key); setError(null);
     try {
       const u = await login(em, pw);
       nav(ROLE_HOME[u.role], { replace: true });
@@ -121,15 +122,13 @@ export default function Login() {
           </div>
 
           <button
-            onClick={() => { resetDB(); toast("Demo data reset to seed state.", "info"); }}
+            onClick={() => { resetDB(); toast("Local view cleared (server data untouched — reloads on next fetch).", "info"); }}
             className="mt-6 inline-flex items-center gap-2 text-xs font-semibold text-slate-400 transition hover:text-brand-700"
           >
-            <RotateCcw className="h-3.5 w-3.5" /> Reset demo data
+            <RotateCcw className="h-3.5 w-3.5" /> Reset local view
           </button>
         </div>
       </div>
     </div>
   );
 }
-
-export { AppShell };

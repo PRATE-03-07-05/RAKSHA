@@ -136,6 +136,12 @@ rule engine. See `docs/ML_TRIAGE.md` and `docs/ML_VIVA.md`.
 `POST/GET /appointments`, `GET/PATCH /appointments/{id}` — patients book/cancel their own; facilities manage status (`SCHEDULED→IN_QUEUE→COMPLETED`, validated).
 `POST/GET /teleconsultations`, `PATCH /teleconsultations/{id}/complete` — outcome is written into the longitudinal record as a consultation.
 
+### Clinical queue (canonical — PHC/CHC/Specialist dashboards)
+| Method | Path | Roles |
+|---|---|---|
+| GET | `/clinical/queue?status=&priority=&limit=&offset=&include_completed=` | PHC_DOCTOR, CHC_DOCTOR, SPECIALIST |
+Auth: JWT; scope derived from `user.role/facility_id/specialty` (frontend filters never widen scope). Response: stable `QueueResponse{items[], total, limit, offset, generated_at, facility_id, role}` with per-item `id, patient_id/name, age, sex, phone, village, queue_status(WAITING/IN_PROGRESS/COMPLETED/CANCELLED), priority(CRITICAL/HIGH/MEDIUM/LOW), priority_score, triage_level, arrival/scheduled_time, waiting_minutes, assigned_facility/clinician, referral_id, reason, source`. Ordering: clinical priority → waiting/arrival time → id; bounded aging (60min→+1 class, max 1, CRITICAL never overtaken). Empty → `200 {items: [], total: 0}`. Queue-management ordering only — triage disclaimers apply.
+
 ### Emergency, notifications, sync, admin
 | Method | Path | Roles | Notes |
 |---|---|---|---|

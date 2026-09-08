@@ -13,13 +13,13 @@
  *    no JWTs, no medical data, no API responses enter this cache.
  *  - Opaque/failed responses are never stored.
  */
-const CACHE = "raksha-shell-v1";
+const CACHE = "raksha-shell-v2";
 
 self.addEventListener("install", (event) => {
-  // Seed the shell cache; "/" pulls in index.html and the hashed assets it
-  // references are added at runtime as they are fetched.
+  // Seed the shell cache; "/" pulls in index.html. Hashed JS/CSS are cached
+  // on first fetch (cache-first below), so offline works after one visit.
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(["/"]).catch(() => undefined))
+    caches.open(CACHE).then((cache) => cache.addAll(["/", "/manifest.json"]).catch(() => undefined))
   );
   self.skipWaiting();
 });
@@ -41,17 +41,23 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return; // never touch the API origin
 
   // Navigations: network-first so refreshes pick up new builds; the cached
-  // shell answers when the device is offline.
+  // shell answers when the device is offline. Cache per-URL (not always "/")
+  // so deep links reload offline.
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req)
         .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put("/", copy)).catch(() => undefined);
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((cache) => {
+              cache.put(req, copy).catch(() => undefined);
+              cache.put("/", res.clone()).catch(() => undefined);
+            }).catch(() => undefined);
+          }
           return res;
         })
         .catch(() =>
-          caches.match("/").then((cached) => cached || Response.error())
+          caches.match(req).then((cached) => cached || caches.match("/").then((c) => c || Response.error()))
         )
     );
     return;

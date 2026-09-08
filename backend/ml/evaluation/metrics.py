@@ -24,7 +24,7 @@ def urgent_recall(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     urgent_pred = np.isin(y_pred, list(URGENT_CLASSES))
     denom = urgent_true.sum()
     if denom == 0:
-        return 1.0
+        return 0.0  # no urgent cases — do not inflate blended score
     return float((urgent_true & urgent_pred).sum() / denom)
 
 

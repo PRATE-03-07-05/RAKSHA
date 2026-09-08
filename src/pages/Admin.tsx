@@ -510,7 +510,9 @@ export function UserManagement() {
                     </td>
                     <td className="py-3 pr-4 text-xs text-slate-600">{facilityName(u.facilityId)}</td>
                     <td className="py-3 pr-4">
-                      <Pill tone="green">Active</Pill>
+                      {(u as unknown as { isActive?: boolean }).isActive === false
+                        ? <Pill tone="red">Inactive</Pill>
+                        : <Pill tone="green">Active</Pill>}
                     </td>
                     <td className="py-3">
                       <div className="flex gap-2">
@@ -545,9 +547,18 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
       toast("Email, name, and password are required", "error");
       return;
     }
+    if (!["PATIENT", "DISTRICT_ADMIN"].includes(form.role) && !form.facility_id) {
+      toast("Facility is required for facility-based roles.", "warning");
+      return;
+    }
     setSaving(true);
     try {
-      await api.adminCreateUser(user as never, form);
+      const payload: Record<string, string> = {
+        email: form.email, name: form.name, password: form.password, role: form.role,
+        phone: form.phone, specialty: form.specialty, district: form.district, village: form.village,
+      };
+      if (form.facility_id) payload.facility_id = form.facility_id;
+      await api.adminCreateUser(user as never, payload as never);
       toast("User created successfully", "success");
       onCreated();
     } catch (e) {
@@ -583,11 +594,9 @@ function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreate
             <option value="DISTRICT_ADMIN">District Admin</option>
           </Select>
         </Field>
-        <Field label="Facility" required>
+        <Field label="Facility" required={form.role !== "PATIENT" && form.role !== "DISTRICT_ADMIN"}>
           {facQ.loading ? (
-            <div className="flex items-center gap-2 text-sm text-slate-500">
-              <Spinner /> Loading facilities...
-            </div>
+            <p className="text-sm text-slate-500">Loading facilities…</p>
           ) : facQ.error ? (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
               Failed to load facilities
@@ -625,7 +634,8 @@ function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: (
   const facQ = useApi(() => api.listFacilities(currentUser as never), []);
   const [form, setForm] = useState({
     name: u.name, role: u.role, facility_id: u.facilityId ?? "", phone: u.phone ?? "",
-    specialty: u.specialty ?? "", district: u.district ?? "", village: u.village ?? ""
+    specialty: u.specialty ?? "", district: u.district ?? "", village: u.village ?? "",
+    is_active: (u as unknown as { isActive?: boolean }).isActive ?? true,
   });
   const [newPassword, setNewPassword] = useState("");
   const [saving, setSaving] = useState(false);
@@ -633,7 +643,9 @@ function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: (
   const submit = async () => {
     setSaving(true);
     try {
-      await api.adminUpdateUser(currentUser as never, u.id, form);
+      const payload: Record<string, unknown> = { ...form };
+      if (!payload.facility_id) delete payload.facility_id;
+      await api.adminUpdateUser(currentUser as never, u.id, payload as never);
       if (newPassword) {
         await api.adminResetPassword(currentUser as never, u.id, newPassword);
       }
@@ -671,9 +683,7 @@ function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: (
         </Field>
         <Field label="Facility">
           {facQ.loading ? (
-            <div className="flex items-center gap-2 text-sm text-slate-500">
-              <Spinner /> Loading facilities...
-            </div>
+            <p className="text-sm text-slate-500">Loading facilities…</p>
           ) : facQ.error ? (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
               Failed to load facilities
@@ -686,6 +696,12 @@ function EditUserModal({ user: u, onClose, onUpdated }: { user: User; onClose: (
               ))}
             </Select>
           )}
+        </Field>
+        <Field label="Account status">
+          <Select value={form.is_active ? "active" : "inactive"} onChange={e => setForm(f => ({ ...f, is_active: e.target.value === "active" }))}>
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+          </Select>
         </Field>
         <Field label="Specialty">
           <Input value={form.specialty} onChange={e => setForm(f => ({ ...f, specialty: e.target.value }))} />
