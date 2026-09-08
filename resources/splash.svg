@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1920">
-  <rect width="1080" height="1920" fill="#0F3D33"/>
-  <g transform="translate(390,760)">
-    <path d="M150 20l110 40v90c0 76-48 128-110 152-62-24-110-76-110-152V60l110-40z" fill="none" stroke="#4ADE80" stroke-width="18" stroke-linejoin="round"/>
-    <path d="M95 165h40l20-50 30 92 20-42h40" stroke="#FFFFFF" stroke-width="20" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-  </g>
-  <text x="540" y="1150" text-anchor="middle" font-family="sans-serif" font-size="72" font-weight="bold" fill="#FFFFFF">RAKSHA</text>
-</svg>
