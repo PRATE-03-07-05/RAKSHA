@@ -15,9 +15,11 @@
 import type { SyncOp } from "./types";
 
 const DB_NAME = "raksha-offline";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const OPS = "sync_ops";
 const PATIENTS = "cached_patients";
+const REFERRALS = "cached_referrals";
+const FOLLOWUPS = "cached_followups";
 const META = "meta";
 const LS_KEY = "raksha.syncops.v1";
 
@@ -33,6 +35,8 @@ function open(): Promise<IDBDatabase | null> {
         const db = req.result;
         if (!db.objectStoreNames.contains(OPS)) db.createObjectStore(OPS, { keyPath: "id" });
         if (!db.objectStoreNames.contains(PATIENTS)) db.createObjectStore(PATIENTS, { keyPath: "id" });
+        if (!db.objectStoreNames.contains(REFERRALS)) db.createObjectStore(REFERRALS, { keyPath: "id" });
+        if (!db.objectStoreNames.contains(FOLLOWUPS)) db.createObjectStore(FOLLOWUPS, { keyPath: "id" });
         if (!db.objectStoreNames.contains(META)) db.createObjectStore(META, { keyPath: "key" });
       };
       req.onsuccess = () => resolve(req.result);
@@ -103,6 +107,38 @@ export async function cachedPatientsPutMany(patients: { id: string }[]): Promise
 export async function cachedPatientsAll(): Promise<{ id: string }[]> {
   const rows = await tx<CachedPatientRecord[]>(PATIENTS, "readonly", s => s.getAll(), []);
   return (rows ?? []).map(r => r.data as { id: string });
+}
+
+async function cachedPutMany(store: string, items: { id: string }[]): Promise<void> {
+  const db = await open();
+  if (!db || items.length === 0) return;
+  return new Promise(resolve => {
+    try {
+      const t = db.transaction(store, "readwrite");
+      const s = t.objectStore(store);
+      items.slice(0, 250).forEach(p => s.put({ id: p.id, cachedAt: Date.now(), data: p }));
+      t.oncomplete = () => resolve();
+      t.onerror = () => resolve();
+    } catch { resolve(); }
+  });
+}
+
+async function cachedAll(store: string): Promise<{ id: string }[]> {
+  const rows = await tx<CachedPatientRecord[]>(store, "readonly", s => s.getAll(), []);
+  return (rows ?? []).map(r => r.data as { id: string });
+}
+
+export async function cachedReferralsPutMany(items: { id: string }[]): Promise<void> {
+  return cachedPutMany(REFERRALS, items);
+}
+export async function cachedReferralsAll(): Promise<{ id: string }[]> {
+  return cachedAll(REFERRALS);
+}
+export async function cachedFollowupsPutMany(items: { id: string }[]): Promise<void> {
+  return cachedPutMany(FOLLOWUPS, items);
+}
+export async function cachedFollowupsAll(): Promise<{ id: string }[]> {
+  return cachedAll(FOLLOWUPS);
 }
 
 /* ----------------------------------------------------------------- metadata */

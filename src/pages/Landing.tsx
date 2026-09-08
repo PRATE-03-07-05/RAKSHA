@@ -6,11 +6,10 @@ import {
   FolderHeart, WifiOff, Route, BrainCircuit, Video, ShieldCheck,
   ArrowRight, UploadCloud, CheckCircle2, AlertTriangle, Languages,
 } from "lucide-react";
-import { assessRisk, TRIAGE_THRESHOLDS, SYMPTOM_OPTIONS } from "../lib/triage";
+import { assessRisk, SYMPTOM_OPTIONS } from "../lib/triage";
 import { RiskBadge, RefStatusBadge, Btn, Pill } from "../components/ui";
 import { useI18n, useReveal } from "../store/providers";
 import { LogoMark } from "../components/shell";
-import { REF_FLOW } from "../store/backend";
 import { cx } from "../lib/utils";
 
 const CHAIN = [
@@ -128,33 +127,247 @@ function TriageDemo() {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* HOW RAKSHA WORKS — live interactive referral workflow explainer.       */
+/* SAFE PRESENTATIONAL DEMO ONLY: local React state, zero backend calls,  */
+/* zero database writes. ONE source of truth: currentStageIndex. Every    */
+/* tracker pill, badge, title, role, process text and button derives from */
+/* WORKFLOW_STAGES[currentStageIndex]. Statuses reuse the canonical       */
+/* backend referral lifecycle (CREATED…COMPLETED); labels mapped in one   */
+/* place. Backend concepts referenced (referrals table, referral_events   */
+/* with actor_id/facility_id/timestamp/transition/notes,                  */
+/* POST /referrals/{id}/transition, audit log, FollowUp) verified in      */
+/* backend/app/routers/referrals.py + backend/app/models.py.              */
+/* ------------------------------------------------------------------ */
+
+type WorkflowStage = {
+  id: string;
+  label: string;
+  title: string;
+  description: string;
+  role: string;
+  facility: string;
+  internalProcess: string;
+  databaseProcess: string;
+  eventProcess: string;
+  nextAction: string;
+  nextRole: string;
+};
+
+const DEMO_PATIENT = "Sita Devi";
+const DEMO_CONTEXT = "Sita Devi · Priority clinical evaluation";
+const DEMO_REF = "RAK-REF-2026-00211";
+const DEMO_ROUTE = "PHC Demapur → CHC Shirur";
+
+const WORKFLOW_STAGES: WorkflowStage[] = [
+  {
+    id: "created",
+    label: "CREATED",
+    title: "Referral created",
+    description: "The referral is created at the originating healthcare point after the patient's case requires care beyond the current facility.",
+    role: "ASHA / ANM / PHC Staff / referring clinician",
+    facility: "Originating facility · PHC Demapur",
+    internalProcess: "Patient context, referral reason, urgency and destination are captured as a referral record linked to the patient's longitudinal record.",
+    databaseProcess: "A referrals row is created (patient, from/to facility, reason, priority, status CREATED).",
+    eventProcess: "A CREATED referral_events row is recorded with timestamp (created_at) and actor (actor_id, actor_role).",
+    nextAction: "Send the referral to the receiving facility.",
+    nextRole: "Referring healthcare worker / PHC",
+  },
+  {
+    id: "sent",
+    label: "SENT",
+    title: "Referral sent to receiving facility",
+    description: "The originating facility has transmitted the referral to the selected destination facility.",
+    role: "Referring facility / PHC Staff",
+    facility: "PHC Demapur → CHC Shirur",
+    internalProcess: "RAKSHA routes the referral into the receiving facility's workflow and notifies the destination team.",
+    databaseProcess: "Referral status becomes SENT via POST /referrals/{id}/transition {target: SENT}.",
+    eventProcess: "A SENT event records the actor, facility and timestamp (actor_id, facility_id, created_at, notes).",
+    nextAction: "Receiving facility acknowledges the referral.",
+    nextRole: "Receiving facility staff",
+  },
+  {
+    id: "acknowledged",
+    label: "ACKNOWLEDGED",
+    title: "Referral acknowledged",
+    description: "The receiving facility has confirmed that the referral has been received.",
+    role: "Receiving facility staff",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "The referral is now visible to the receiving side as an actionable case — it is no longer sitting silently at the origin.",
+    databaseProcess: "Acknowledgement is recorded against the referral workflow (status ACKNOWLEDGED).",
+    eventProcess: "An ACKNOWLEDGED event is appended to the referral timeline with actor and timestamp.",
+    nextAction: "Review and accept responsibility for the referral.",
+    nextRole: "Receiving clinician / facility",
+  },
+  {
+    id: "accepted",
+    label: "ACCEPTED",
+    title: "Referral accepted",
+    description: "The receiving facility has accepted the referral and is taking responsibility for the next stage of care.",
+    role: "Receiving clinician / facility",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "The case becomes part of the receiving facility's active clinical workflow.",
+    databaseProcess: "Referral status becomes ACCEPTED.",
+    eventProcess: "An ACCEPTED event is appended with actor and timestamp.",
+    nextAction: "Patient arrives at the receiving facility.",
+    nextRole: "Receiving facility / front desk / clinical team",
+  },
+  {
+    id: "arrived",
+    label: "ARRIVED",
+    title: "Patient arrived",
+    description: "The patient has reached the receiving facility and the referral is now connected to an actual care encounter.",
+    role: "Receiving facility staff",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "Arrival/check-in links the patient to the active referral workflow.",
+    databaseProcess: "Arrival state is recorded against the referral (status ARRIVED).",
+    eventProcess: "An ARRIVED event is added to the referral timeline.",
+    nextAction: "Begin clinical consultation.",
+    nextRole: "Doctor / specialist",
+  },
+  {
+    id: "in-consultation",
+    label: "IN CONSULTATION",
+    title: "Clinical consultation started",
+    description: "The receiving clinician is evaluating the patient and reviewing the relevant referral and health-record context.",
+    role: "PHC Doctor / CHC Doctor / Specialist",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "The clinician can review the patient's relevant longitudinal information and referral history.",
+    databaseProcess: "Consultation/encounter information becomes linked to the patient workflow.",
+    eventProcess: "An IN_CONSULTATION event is recorded.",
+    nextAction: "Provide treatment or care plan.",
+    nextRole: "Clinician / care team",
+  },
+  {
+    id: "treatment",
+    label: "TREATMENT",
+    title: "Treatment / care in progress",
+    description: "The patient is receiving the required treatment or care at the receiving facility.",
+    role: "Clinician / care team",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "Clinical actions, treatment and relevant care information are recorded against the patient's record as supported by the application.",
+    databaseProcess: "The referral remains active while treatment is in progress.",
+    eventProcess: "A TREATMENT event is recorded where supported by the workflow.",
+    nextAction: "Complete the referral and initiate follow-up when required.",
+    nextRole: "Clinician / follow-up team",
+  },
+  {
+    id: "completed",
+    label: "COMPLETED",
+    title: "Referral completed",
+    description: "The referral lifecycle has reached completion and the referral loop is closed.",
+    role: "Receiving clinician / responsible care team",
+    facility: "Receiving facility · CHC Shirur",
+    internalProcess: "The outcome of the referral is finalized (an outcome is required to complete).",
+    databaseProcess: "Referral status becomes COMPLETED (completed_at/outcome set).",
+    eventProcess: "A final COMPLETED event closes the referral timeline.",
+    nextAction: "Continue follow-up/notification workflow when required.",
+    nextRole: "Follow-up team / originating healthcare worker",
+  },
+];
+
 function RefLoopDemo() {
-  const [idx, setIdx] = useState(2);
-  const status = REF_FLOW[idx];
+  // ONE source of truth — every pixel below derives from currentStage.
+  const [currentStageIndex, setCurrentStageIndex] = useState(0);
+  const currentStage = WORKFLOW_STAGES[currentStageIndex] ?? WORKFLOW_STAGES[0];
+  const isLast = currentStageIndex >= WORKFLOW_STAGES.length - 1;
+
   return (
     <div className="rounded-2xl border border-brand-900/10 bg-white p-6 shadow-card">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {REF_FLOW.map((s, i) => (
-          <React.Fragment key={s}>
-            <button
-              onClick={() => setIdx(i)}
-              className={cx("rounded-full border px-3 py-1.5 text-[11px] font-bold transition", i < idx ? "border-emerald-300 bg-emerald-50 text-emerald-800" : i === idx ? "border-brand-700 bg-brand-800 text-white shadow-sm" : "border-brand-900/10 bg-white text-slate-400")}
-            >
-              {i < idx ? "✓ " : ""}{s.replace("_", " ")}
-            </button>
-            {i < REF_FLOW.length - 1 && <ArrowRight className="h-3 w-3 text-brand-300" />}
-          </React.Fragment>
-        ))}
+      {/* Tracker rendered from the SAME array + SAME index. */}
+      <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Referral workflow stages">
+        {WORKFLOW_STAGES.map((s, i) => {
+          const done = i < currentStageIndex;
+          const current = i === currentStageIndex;
+          return (
+            <React.Fragment key={s.id}>
+              <button
+                onClick={() => setCurrentStageIndex(i)}
+                aria-label={`Show ${s.label} stage`}
+                aria-current={current ? "step" : undefined}
+                className={cx(
+                  "rounded-full border px-3 py-1.5 text-[11px] font-bold transition focus-visible:outline-2 focus-visible:outline-brand-600",
+                  done && "border-emerald-300 bg-emerald-50 text-emerald-800",
+                  current && "border-brand-700 bg-brand-800 text-white shadow-sm",
+                  !done && !current && "border-brand-900/10 bg-white text-slate-400 hover:border-brand-400"
+                )}
+              >
+                {done ? "✓ " : current ? "● " : "○ "}{s.label}
+              </button>
+              {i < WORKFLOW_STAGES.length - 1 && <ArrowRight className="h-3 w-3 shrink-0 text-brand-300" aria-hidden="true" />}
+            </React.Fragment>
+          );
+        })}
       </div>
-      <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_auto]">
-        <div className="rounded-xl border border-dashed border-brand-300 bg-brand-50/50 p-4">
-          <p className="font-mono text-[11px] font-semibold text-brand-500">RAK-REF-2026-00211 · PHC Demapur → CHC Shirur</p>
-          <p className="font-display mt-1 text-lg font-bold text-brand-950">Sita Devi · Priority clinical evaluation</p>
-          <p className="mt-1 text-sm text-slate-500">Every transition appends an immutable event — timestamp, actor, facility, notes. Nothing can silently disappear.</p>
+
+      {/* Lower panel: fully derived from currentStage — zero static stage text. */}
+      <div key={currentStage.id} className="anim-fade-in mt-5 grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
+        <div className="space-y-4">
+          <div className="rounded-xl border border-dashed border-brand-300 bg-brand-50/50 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-mono text-[11px] font-semibold text-brand-500">{DEMO_REF} · {DEMO_ROUTE}</p>
+              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-800">Workflow example · demo only</span>
+            </div>
+            <p className="mt-1 text-xs text-slate-500">{DEMO_CONTEXT}</p>
+            <p className="font-display mt-1 text-lg font-bold text-brand-950">{currentStage.title}</p>
+            <div className="mt-2"><RefStatusBadge status={currentStage.label.replace(" ", "_") as import("../lib/types").RefStatus} /></div>
+            <div className="mt-3 space-y-2.5 text-sm leading-relaxed">
+              <div>
+                <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">What is happening</p>
+                <p className="mt-0.5 text-slate-600">{currentStage.description}</p>
+              </div>
+              <div>
+                <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">Responsible role</p>
+                <p className="mt-0.5 text-slate-600">{currentStage.role} · {currentStage.facility}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-brand-900/10 bg-white p-4">
+            <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">Inside RAKSHA</p>
+            <p className="mt-1.5 text-sm leading-relaxed text-slate-700">{currentStage.internalProcess}</p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg bg-brand-50/60 p-3">
+                <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">Database update</p>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600">{currentStage.databaseProcess}</p>
+              </div>
+              <div className="rounded-lg bg-brand-50/60 p-3">
+                <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-600">Event log</p>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600">{currentStage.eventProcess}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-brand-900/10 bg-brand-950 p-4 text-white">
+            <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-brand-300">Next</p>
+            <p className="mt-1 text-sm font-semibold">{currentStage.nextAction}</p>
+            <p className="mt-1 text-xs text-brand-300">Next responsible role: {currentStage.nextRole}</p>
+            <div className="mt-3">
+              {isLast ? (
+                <Btn size="sm" variant="secondary" disabled aria-disabled="true"><CheckCircle2 className="h-3.5 w-3.5" /> Workflow completed</Btn>
+              ) : (
+                <Btn size="sm" variant="secondary" onClick={() => setCurrentStageIndex(prev => Math.min(prev + 1, WORKFLOW_STAGES.length - 1))}>Advance step <ArrowRight className="h-3.5 w-3.5" /></Btn>
+              )}
+            </div>
+          </div>
         </div>
-        <div className="flex flex-col items-start justify-center gap-2 sm:items-end">
-          <RefStatusBadge status={status} />
-          <Btn size="sm" variant="secondary" onClick={() => setIdx(i => (i + 1) % REF_FLOW.length)}>Advance step <ArrowRight className="h-3.5 w-3.5" /></Btn>
+
+        {/* Event-shape card: clearly an EXAMPLE, never real audit data. */}
+        <div className="flex flex-col gap-3">
+          <div className="rounded-xl border border-brand-900/10 bg-white p-4">
+            <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-slate-500">Event recorded · example shape</p>
+            <p className="mt-2 font-mono text-sm font-extrabold text-brand-800">{currentStage.label}</p>
+            <div className="mt-2 space-y-1 text-xs text-slate-500">
+              <p>Actor: <span className="font-semibold text-brand-900">{currentStage.role}</span></p>
+              <p>Facility: <span className="font-semibold text-brand-900">{currentStage.facility}</span></p>
+              <p>Timestamp: <span className="font-mono">created_at at transition time</span> · notes optional</p>
+              <p className="text-[11px] italic">Stored in referral_events + audit log. Demo values — no database writes occur here.</p>
+            </div>
+          </div>
+          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+            <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.14em] text-emerald-700"><ShieldCheck className="h-3.5 w-3.5" /> Safe demo</p>
+            <p className="mt-1.5 text-xs leading-relaxed text-emerald-900">Exploring stages never calls the referral API and never modifies {DEMO_PATIENT}'s records. Real transitions happen in authenticated dashboards via <span className="font-mono">POST /referrals/{"{id}"}/transition</span>.</p>
+          </div>
         </div>
       </div>
     </div>

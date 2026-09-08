@@ -8,7 +8,7 @@ import type { Availability, RefStatus, RiskLevel } from "../lib/types";
 /* ------------------------------------------------------------- buttons */
 
 type BtnVariant = "primary" | "secondary" | "ghost" | "danger" | "warning" | "dark";
-export function Btn({ variant = "primary", size = "md", loading, className, children, ...rest }:
+export function Btn({ variant = "primary", size = "md", loading, className, children, disabled, ...rest }:
   React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: BtnVariant; size?: "sm" | "md" | "lg"; loading?: boolean }) {
   const v: Record<BtnVariant, string> = {
     primary: "bg-brand-700 text-white hover:bg-brand-800 active:scale-[0.98] shadow-sm",
@@ -22,6 +22,8 @@ export function Btn({ variant = "primary", size = "md", loading, className, chil
   return (
     <button
       className={cx("inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-all disabled:opacity-50 disabled:pointer-events-none", v[variant], s, className)}
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...rest}
     >
       {loading && <Loader2 className="h-4 w-4 animate-spin" />}
@@ -98,7 +100,8 @@ export function RiskBadge({ level, size = "md" }: { level: RiskLevel; size?: "sm
     CRITICAL: { tone: "red", label: t("critical") },
   };
   const m = map[level];
-  return <span className={cx(size === "lg" && "text-sm px-3.5 py-1.5")}> <Pill tone={m.tone} pulse={level === "CRITICAL"}>{m.label}</Pill></span>;
+  if (!m) return <Pill tone="slate">{level}</Pill>;
+  return <Pill tone={m.tone} pulse={level === "CRITICAL"}>{m.label}</Pill>;
 }
 
 export const REF_TONE: Record<RefStatus, "slate" | "sky" | "brand" | "amber" | "green" | "red"> = {
@@ -147,7 +150,7 @@ export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
   return <textarea {...props} className={cx(inputCls, "min-h-[90px]", props.className)} />;
 }
 export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...props} className={cx(inputCls, "appearance-none bg-[url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2212%22 height=%2212%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%23475569%22 stroke-width=%222.5%22%3E%3Cpath d=%22m6 9 6 6 6-6%22/%3E%3C/svg%3E')] bg-[right_12px_center] bg-no-repeat pr-9", props.className)} />;
+  return <select {...props} className={cx(inputCls, "appearance-none bg-no-repeat pr-9", props.className)} style={{ backgroundImage: "url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2212%22 height=%2212%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22%23475569%22 stroke-width=%222.5%22%3E%3Cpath d=%22m6 9 6 6 6-6%22/%3E%3C/svg%3E')", backgroundPosition: "right 12px center", ...props.style }} />;
 }
 
 /* ---------------------------------------------------------------- modal */
@@ -157,7 +160,9 @@ export function Modal({ open, onClose, title, children, wide }: { open: boolean;
     if (!open) return;
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { window.removeEventListener("keydown", h); document.body.style.overflow = prev; };
   }, [open, onClose]);
   if (!open) return null;
   return (

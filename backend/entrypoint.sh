@@ -22,7 +22,11 @@ import os, sys
 import psycopg2
 
 # libpq wants the plain scheme; strip the SQLAlchemy driver suffix.
-dsn = os.environ["DATABASE_URL"].replace("postgresql+psycopg2://", "postgresql://", 1)
+_dbu = os.environ.get("DATABASE_URL", "")
+if not _dbu:
+    print("[boot] ERROR: DATABASE_URL is not set — aborting.", flush=True)
+    sys.exit(2)
+dsn = _dbu.replace("postgresql+psycopg2://", "postgresql://", 1)
 try:
     conn = psycopg2.connect(dsn, connect_timeout=3)
     try:
@@ -47,17 +51,27 @@ done
 echo "[boot] PostgreSQL is reachable (host 'db' resolved, auth OK)."
 echo "[boot] Running Alembic migrations: alembic upgrade head"
 alembic upgrade head
-echo "[boot] Migrations complete. Seeding demo data: python seed.py"
-python seed.py
-echo "[boot] Seed complete."
+# Seed only when explicitly enabled (never seed weak demo creds in production).
+if [ "${RAKSHA_SEED_DEMO:-false}" = "true" ]; then
+  echo "[boot] Migrations complete. Seeding demo data: python seed.py"
+  python seed.py
+  echo "[boot] Seed complete."
+else
+  echo "[boot] Skipping demo seed (RAKSHA_SEED_DEMO!=true)."
+fi
 
 # First-run ML triage model training (only if no artifact is present). The
 # synthetic, clearly-labelled dev dataset is used. A failure here never blocks
 # startup — the API transparently falls back to the rule-based engine.
+# Never train prod on synthetic data: require explicit opt-in.
 if [ ! -f ml/models/triage_model.joblib ]; then
-  echo "[boot] No ML triage model found — training on the synthetic set (first run only)..."
-  python -m ml.training.train --synthetic \
-    || echo "[boot] WARNING: ML training failed — the rule-based fallback will serve triage."
+  if [ "${RAKSHA_TRAIN_SYNTHETIC:-false}" = "true" ]; then
+    echo "[boot] No ML triage model found — training on the synthetic set (first run only)..."
+    python -m ml.training.train --synthetic \
+      || echo "[boot] WARNING: ML training failed — the rule-based fallback will serve triage."
+  else
+    echo "[boot] No ML model found — synthetic training disabled (RAKSHA_TRAIN_SYNTHETIC!=true); using rule fallback."
+  fi
 else
   echo "[boot] ML triage model already present — skipping training."
 fi

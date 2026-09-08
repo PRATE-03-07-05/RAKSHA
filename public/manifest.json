@@ -1,0 +1,10 @@
+{
+  "name": "RAKSHA",
+  "short_name": "RAKSHA",
+  "description": "Responsive AI-enabled Knowledge & Smart Healthcare Assistance",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0F3D33",
+  "icons": []
+}

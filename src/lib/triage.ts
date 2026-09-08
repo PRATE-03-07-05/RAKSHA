@@ -109,7 +109,7 @@ export function assessRisk(input: TriageInput): TriageResult {
   factors.forEach(f => { sev[f.severity] += 1; });
 
   let level: RiskLevel = "LOW";
-  if (sev.critical > 0 || input.severity === "SEVERE" && sev.high > 0) level = "CRITICAL";
+  if (sev.critical > 0 || (input.severity === "SEVERE" && sev.high > 0)) level = "CRITICAL";
   else if (sev.high > 0 || sev.warn >= 2) level = "HIGH";
   else if (sev.warn === 1) level = "MEDIUM";
 
@@ -121,8 +121,14 @@ export function assessRisk(input: TriageInput): TriageResult {
   if ((input.age < T.ageInfant || input.age >= T.ageElder) && level !== "LOW") {
     factors.push({ label: input.age < T.ageInfant ? "Infant age group" : "Elderly age group", detail: `Age ${input.age} increases vulnerability to deterioration.`, severity: "info" });
     if (level === "MEDIUM") level = "HIGH";
-    else if (level === "HIGH" && input.age >= T.ageElder && sev.high > 0) level = level;
+    // HIGH stays HIGH (elderly escalation already reflected in factors); CRITICAL never downgrades.
   }
+
+  // Low RR / low diastolic are also abnormal — flag them (previously ignored).
+  if (input.rr !== undefined && input.rr > 0 && input.rr < 10)
+    factors.push({ label: "Very slow breathing rate", detail: `Respiratory rate ${input.rr}/min is abnormally low.`, severity: "high" });
+  if (input.dia !== undefined && input.dia > 0 && input.dia < 40)
+    factors.push({ label: "Very low diastolic pressure", detail: `Diastolic ${input.dia} mmHg is abnormally low.`, severity: "high" });
 
   if (factors.length === 0) factors.push({ label: "No risk signals detected", detail: "Reported observations are within configured normal ranges.", severity: "info" });
 

@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Database (PostgreSQL)
     database_url: str = "postgresql+psycopg2://raksha:raksha@localhost:5432/raksha"
 
-    # Auth
+    # Auth — must be overridden in production via JWT_SECRET env var.
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 720  # 12h
@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    def model_post_init(self, __context) -> None:
+        if self.environment.lower() == "production" and self.jwt_secret == "change-me-in-production":
+            raise ValueError("JWT_SECRET must be set in production (refusing to run with default secret)")
 
 
 @lru_cache

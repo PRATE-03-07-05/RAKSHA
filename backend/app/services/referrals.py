@@ -56,7 +56,9 @@ def next_statuses(current: ReferralStatus) -> list[ReferralStatus]:
 def is_overdue(referral: Referral, today: date | None = None) -> bool:
     if referral.status in (ReferralStatus.COMPLETED, ReferralStatus.CANCELLED):
         return False
-    exp = referral.expected_date or (today or date.today())
+    if referral.expected_date is None:
+        return False  # no SLA date set — never mark overdue
+    exp = referral.expected_date
     return exp < (today or date.today())
 
 
@@ -82,12 +84,10 @@ def _authorize_scope(user: User, referral: Referral, target: ReferralStatus) -> 
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the creator, source facility or admin can cancel")
         return
     if target == ReferralStatus.ACKNOWLEDGED:
-        # Acknowledgement is a coordination step: referral-desk staff
-        # (PHC_STAFF) may confirm receipt on behalf of the network, while
-        # clinical roles must belong to the receiving facility.
-        if user.role != Role.PHC_STAFF and not at_destination:
+        # Acknowledgement must come from the receiving facility.
+        if not at_destination:
             raise HTTPException(status.HTTP_403_FORBIDDEN,
-                                "Acknowledgement requires the receiving facility or referral-desk staff")
+                                "Acknowledgement requires the receiving facility")
     elif target in (ReferralStatus.ACCEPTED, ReferralStatus.IN_CONSULTATION,
                     ReferralStatus.TREATMENT, ReferralStatus.COMPLETED):
         if not at_destination:
@@ -186,5 +186,12 @@ def _notify_transition(db: Session, actor: User, referral: Referral,
 
 
 def generate_code(db: Session) -> str:
-    n = db.query(Referral).count() + 1
-    return f"REF-{date.today().year}-{n:05d}"
+    from sqlalchemy import select as _select
+    for _attempt in range(1, 50):
+        n = db.query(Referral).count() + _attempt
+        candidate = f"REF-{date.today().year}-{n:05d}"
+        exists = db.execute(_select(Referral.id).where(Referral.code == candidate)).first()
+        if not exists:
+            return candidate
+    import uuid as _uuid
+    return f"REF-{date.today().year}-{_uuid.uuid4().hex[:5].upper()}"

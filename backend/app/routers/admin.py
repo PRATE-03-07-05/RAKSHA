@@ -27,12 +27,18 @@ ACTIVE_STATES = {ReferralStatus.SENT, ReferralStatus.ACKNOWLEDGED, ReferralStatu
 
 @router.get("/analytics", response_model=AnalyticsOut, summary="District-level operational analytics")
 def analytics(_: CurrentUser, db: DB):
+    from sqlalchemy import func as _func
+    from datetime import timezone as _tz
+    def _aware(dt):
+        return dt if dt is None or dt.tzinfo is not None else dt.replace(tzinfo=_tz.utc)
+    total_patients = db.execute(select(_func.count()).select_from(Patient)).scalar() or 0
+    total_referrals = db.execute(select(_func.count()).select_from(Referral)).scalar() or 0
+    total_users = db.execute(select(_func.count()).select_from(User)).scalar() or 0
+    active_emergencies = db.execute(select(_func.count()).select_from(EmergencyEvent)
+                                    .where(EmergencyEvent.status == EmergencyStatus.ACTIVE)).scalar() or 0
     patients = db.execute(select(Patient)).scalars().all()
     referrals = db.execute(select(Referral)).scalars().all()
     facilities = db.execute(select(Facility).where(Facility.is_active.is_(True))).scalars().all()
-    total_users = len(db.execute(select(User)).scalars().all())
-    active_emergencies = len(db.execute(select(EmergencyEvent)
-                                        .where(EmergencyEvent.status == EmergencyStatus.ACTIVE)).scalars().all())
 
     completed = [r for r in referrals if r.status == ReferralStatus.COMPLETED]
     active = [r for r in referrals if r.status in ACTIVE_STATES]
@@ -40,16 +46,22 @@ def analytics(_: CurrentUser, db: DB):
     pending = [r for r in referrals if r.status in (ReferralStatus.CREATED, ReferralStatus.SENT)]
 
     completion_rate = round(len(completed) / len(referrals), 3) if referrals else 0.0
-    durations = [((r.completed_at - r.created_at).total_seconds() / 3600)
-                 for r in completed if r.completed_at]
+    durations = []
+    for r in completed:
+        if r.completed_at and r.created_at:
+            try:
+                durations.append((_aware(r.completed_at) - _aware(r.created_at)).total_seconds() / 3600)
+            except Exception:
+                continue
     avg_hours = round(sum(durations) / len(durations), 1) if durations else None
 
-    # latest assessment per patient
-    latest: dict[str, Assessment] = {}
-    for a in db.execute(select(Assessment).order_by(Assessment.created_at.asc())).scalars():
-        latest[a.patient_id] = a
-    high = [a for a in latest.values() if a.level.value in ("HIGH", "CRITICAL")]
-    critical = [a for a in latest.values() if a.level.value == "CRITICAL"]
+    # latest assessment per patient (efficient MAX query, not full-table Python loop)
+    from sqlalchemy import func as _func2
+    _sub = select(Assessment.patient_id, _func2.max(Assessment.created_at).label("mx")).group_by(Assessment.patient_id).subquery()
+    _latest_rows = db.execute(select(Assessment).join(
+        _sub, (Assessment.patient_id == _sub.c.patient_id) & (Assessment.created_at == _sub.c.mx))).scalars().all()
+    high = [a for a in _latest_rows if a.level.value in ("HIGH", "CRITICAL")]
+    critical = [a for a in _latest_rows if a.level.value == "CRITICAL"]
 
     today = date.today()
     missed = db.execute(select(FollowUp).where(FollowUp.status == FollowUpStatus.SCHEDULED,
@@ -89,14 +101,17 @@ def analytics(_: CurrentUser, db: DB):
         res = db.get(FacilityResource, f.id)
         if not res:
             continue
-        shortages += sum(1 for m in res.medicines if m.get("status") == "UNAVAILABLE")
-        shortages += sum(1 for d in (res.cbc.value, res.xray.value, res.ultrasound.value) if d == "UNAVAILABLE")
+        meds = res.medicines if isinstance(res.medicines, list) else []
+        shortages += sum(1 for m in meds if isinstance(m, dict) and m.get("status") == "UNAVAILABLE")
+        def _av(v):
+            return v.value if hasattr(v, "value") else str(v)
+        shortages += sum(1 for d in (_av(res.cbc), _av(res.xray), _av(res.ultrasound)) if d == "UNAVAILABLE")
 
     return AnalyticsOut(
-        total_patients=len(patients),
+        total_patients=total_patients,
         total_users=total_users,
         active_emergencies=active_emergencies,
-        total_referrals=len(referrals),
+        total_referrals=total_referrals,
         active_referrals=len(active),
         pending_referrals=len(pending),
         completed_referrals=len(completed),
@@ -156,7 +171,10 @@ def list_users(_: CurrentUser, db: DB,
                offset: int = Query(0, ge=0)):
     q = select(User).order_by(User.created_at.desc())
     if role:
-        q = q.where(User.role == Role(role.upper()))
+        try:
+            q = q.where(User.role == Role(role.upper()))
+        except ValueError:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown role '{role}'")
     rows = db.execute(q.limit(limit).offset(offset)).scalars().all()
     return [UserOut.model_validate(u) for u in rows]
 
@@ -199,6 +217,8 @@ def update_user(user_id: str, body: UserUpdate, admin: CurrentUser, db: DB):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
     if u.id == admin.id and body.is_active is False:
         raise HTTPException(status.HTTP_409_CONFLICT, "You cannot deactivate your own account")
+    if u.id == admin.id and body.role is not None and body.role != u.role:
+        raise HTTPException(status.HTTP_409_CONFLICT, "You cannot change your own role (would lock out admin)")
     if body.facility_id and db.get(Facility, body.facility_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Facility not found")
 

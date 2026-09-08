@@ -17,7 +17,7 @@ def test_create_patient_generates_rak_id(client, db):
 
 def test_search_by_name_and_rak_id(client, db):
     asha = make_user(db, Role.ASHA, email="pat-search@test.raksha")
-    make_patient(db, name="Unique Zebra", rak_id="RAK-PAT-2026-00999")
+    make_patient(db, asha_id=asha.id, name="Unique Zebra", rak_id="RAK-PAT-2026-00999")
     r1 = client.get("/patients?q=Zebra", headers=auth_headers(asha))
     assert r1.status_code == 200 and r1.json()["total"] == 1
     r2 = client.get("/patients?q=2026-00999", headers=auth_headers(asha))

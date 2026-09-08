@@ -50,7 +50,10 @@ class SmsChannel(Channel):
 
 class FcmChannel(Channel):
     """Firebase Cloud Messaging integration point (isolated)."""
-    name = NotificationChannel.IN_APP  # delivered as in-app until FCM configured
+    # FCM has no dedicated enum value yet; reuse EMAIL slot is wrong, so keep
+    # this channel unregistered until a real FCM channel is added to the model.
+    # Delivered as in-app until FCM configured.
+    name = NotificationChannel.EMAIL
 
     def deliver(self, notification: Notification) -> bool:
         s = get_settings()
@@ -100,9 +103,13 @@ def notify(
             user_id=user_id, patient_id=patient_id, kind=NotificationKind(kind),
             channel=NotificationChannel.SMS, title=title, body=body,
             ref_kind=ref_kind, ref_id=ref_id,
-            delivered=_channels[NotificationChannel.SMS].deliver(n),
+            delivered=False,
         )
         db.add(sms_row)
+        db.flush()
+        # Deliver the SMS row itself (not the in-app row) so provider status
+        # is recorded on the correct outbox entry.
+        sms_row.delivered = _channels[NotificationChannel.SMS].deliver(sms_row)
 
     log_action(db, actor, AuditAction.NOTIFICATION_SEND, "notification", n.id,
                patient_id=patient_id, detail={"kind": kind, "title": title})

@@ -6,6 +6,12 @@ export function cx(...parts: (string | false | null | undefined)[]): string {
 
 let seq = 1000;
 export function uid(prefix: string): string {
+  try {
+    // Collision-safe idempotency keys across reloads.
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      return `${prefix}-${(crypto as Crypto).randomUUID()}`;
+    }
+  } catch { /* fall through */ }
   seq += 1;
   return `${prefix}-${Date.now().toString(36)}${seq.toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
 }
@@ -52,8 +58,9 @@ export function relTime(ts: number): string {
 }
 
 export function daysUntil(dateStr: string): number {
-  const target = new Date(dateStr + "T23:59:59").getTime();
-  return Math.ceil((target - Date.now()) / 86400000);
+  const d = new Date(dateStr.includes("T") ? dateStr : dateStr + "T23:59:59");
+  if (isNaN(d.getTime())) return 0;
+  return Math.ceil((d.getTime() - Date.now()) / 86400000);
 }
 
 export function todayISO(offsetDays = 0): string {
@@ -70,34 +77,9 @@ export function ageFrom(dob: string): number {
 }
 
 export function initials(name: string): string {
-  return name.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]!.toUpperCase()).join("");
+  if (!name) return "?";
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]!.toUpperCase()).join("") || "?";
 }
 
-/** Deterministic pseudo-QR matrix for the RAKSHA ID card (demo visual). */
-export function qrMatrix(text: string, size = 21): boolean[][] {
-  let seed = hashStr(text);
-  const rnd = () => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed / 4294967296; };
-  const g: boolean[][] = Array.from({ length: size }, () => Array.from({ length: size }, () => rnd() > 0.52));
-  const finder = (r: number, c: number) => {
-    for (let i = 0; i < 7; i++) for (let j = 0; j < 7; j++) {
-      const ring = i === 0 || i === 6 || j === 0 || j === 6;
-      const core = i >= 2 && i <= 4 && j >= 2 && j <= 4;
-      g[r + i]![c + j] = ring || core;
-    }
-    for (let i = -1; i < 8; i++) for (let j = -1; j < 8; j++) {
-      const rr = r + i, cc = c + j;
-      if (rr >= 0 && rr < size && cc >= 0 && cc < size && (i === -1 || i === 7 || j === -1 || j === 7)) g[rr]![cc] = false;
-    }
-  };
-  finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
-  return g;
-}
-
-/** Fake JWT for the prototype — structured like a real token, clearly demo-grade. */
-export function makeToken(userId: string, role: string): string {
-  const enc = (o: unknown) => btoa(JSON.stringify(o)).replace(/=+$/, "");
-  const header = enc({ alg: "HS256", typ: "JWT", note: "demo-token" });
-  const payload = enc({ sub: userId, role, iat: Date.now(), exp: Date.now() + 12 * 3600000 });
-  const sig = hashStr(header + payload).toString(36);
-  return `${header}.${payload}.${sig}`;
-}
+/* qrMatrix / makeToken removed: real QRCode component (qrcode lib) is used;
+   demo JWT helper was dead code and used btoa (unicode-unsafe). */

@@ -29,6 +29,10 @@ _CLASS_FRACTIONS = {"LOW": 0.45, "MEDIUM": 0.30, "HIGH": 0.17, "CRITICAL": 0.08}
 
 def _sample_features(rng: np.random.Generator, n: int) -> pd.DataFrame:
     age = rng.integers(0, 91, n).astype(float)
+    # Gender-aware pregnancy: only females 15-49 can be pregnant (~10% of them).
+    _is_female_childbearing = (rng.random(n) < 0.5) & (age >= 15) & (age <= 49)
+    _preg_rate = np.where(_is_female_childbearing, 0.20, 0.0)
+    pregnant = (rng.random(n) < _preg_rate).astype(float)
     spo2 = np.clip(rng.normal(96.5, 2.6, n), 82, 100).round(0)
     respiratory_rate = np.clip(rng.normal(20, 5, n), 8, 60).round(0)
     temperature = np.clip(rng.normal(37.4, 0.9, n), 35.0, 41.5).round(1)
@@ -37,7 +41,6 @@ def _sample_features(rng: np.random.Generator, n: int) -> pd.DataFrame:
     breathing_difficulty = rng.binomial(1, 0.28, n).astype(float)
     chest_pain = rng.binomial(1, 0.12, n).astype(float)
     duration_days = rng.integers(0, 15, n).astype(float)
-    pregnant = rng.binomial(1, 0.10, n).astype(float)
     has_chronic = rng.binomial(1, 0.25, n).astype(float)
     severity = rng.choice(len(SEVERITY_VALUES), n, p=[0.5, 0.35, 0.15])
     return pd.DataFrame({

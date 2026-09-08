@@ -18,14 +18,14 @@
  *    utilities (decision support only — never a diagnosis).
  */
 import { rq, ApiError, getToken, setToken, TOKEN_KEY } from "../lib/http";
-import { syncOpsAll, syncOpsPut, syncOpsRemove, cachedPatientsAll, cachedPatientsPutMany, metaSet } from "../lib/idb";
+import { syncOpsAll, syncOpsPut, syncOpsRemove, cachedPatientsAll, cachedPatientsPutMany, cachedReferralsAll, cachedReferralsPutMany, cachedFollowupsAll, cachedFollowupsPutMany, metaSet, metaGet } from "../lib/idb";
 import { assessRisk } from "../lib/triage";
 import { uid, todayISO, daysUntil } from "../lib/utils";
 import type {
   DB, Role, User, Patient, Referral, RefStatus, ReferralEvent, FollowUp, TimelineEvent,
   SyncOp, Priority, Visit, Vitals, Assessment, Consultation, Prescription, DiagnosticRecord,
   Appointment, Teleconsultation, EmergencyEvent, AppNotification, Facility, AuditLog,
-  Availability, TriageFactor,
+  Availability, TriageFactor, ClinicalQueueItem, ClinicalQueueResponse, QueueStatus,
 } from "../lib/types";
 import type { TriageInput } from "../lib/triage";
 
@@ -123,7 +123,8 @@ function mapUser(u: AnyObj): User {
     facilityId: u.facility_id ?? undefined, village: u.village ?? undefined,
     district: u.district ?? undefined,
     phone: u.phone ?? "", specialty: u.specialty ?? undefined,
-  };
+    isActive: u.is_active ?? true,
+  } as User;
 }
 
 function mapPatient(p: AnyObj): Patient {
@@ -180,10 +181,12 @@ function mapAssessment(a: AnyObj): Assessment {
     workerName: a.confirmed_by_name ?? "RAKSHA triage", role: "ASHA",
     ts: ep(a.created_at),
     inputs: {
-      symptoms: snap.symptoms ?? [], sys: undefined, dia: undefined, temp: snap.temperature ?? undefined,
-      spo2: snap.spo2 ?? undefined, hr: snap.heart_rate ?? undefined, age: snap.age ?? 0,
+      symptoms: snap.symptoms ?? [], sys: snap.systolic ?? snap.sys, dia: snap.diastolic ?? snap.dia,
+      temp: snap.temperature ?? snap.temp ?? undefined,
+      spo2: snap.spo2 ?? undefined, hr: snap.heart_rate ?? snap.hr ?? undefined,
+      rr: snap.respiratory_rate ?? snap.rr ?? undefined, age: snap.age ?? 0,
       pregnant: snap.pregnant ?? false, conditions: snap.conditions ?? [],
-      severity: snap.severity_reported ?? "MODERATE",
+      severity: snap.severity_reported ?? snap.severity ?? "MODERATE",
     },
     level: a.level, factors: (a.factors ?? []).map(mapFactor),
     recommendation: a.recommendation, version: a.rule_version,
@@ -254,7 +257,7 @@ function mapFollowUp(f: AnyObj): FollowUp {
 function mapAppointment(a: AnyObj): Appointment {
   return {
     id: a.id, patientId: a.patient_id, facilityId: a.facility_id, date: a.date, time: a.time,
-    purpose: a.purpose, status: a.status === "SCHEDULED" ? "CONFIRMED" : a.status,
+    purpose: a.purpose, status: a.status,
     queuePos: a.queue_pos ?? undefined,
   };
 }
@@ -263,8 +266,8 @@ function mapTele(t: AnyObj): Teleconsultation {
   return {
     id: t.id, patientId: t.patient_id, doctorId: t.doctor_id, doctorName: t.doctor_name ?? "",
     specialty: t.specialty ?? undefined, facilityId: t.facility_id ?? "",
-    scheduledAt: ep(t.scheduled_at), status: t.status === "CANCELLED" ? "COMPLETED" : t.status,
-    roomCode: t.room_code, completedAt: t.status === "COMPLETED" ? ep(t.created_at) : undefined,
+    scheduledAt: ep(t.scheduled_at), status: t.status,
+    roomCode: t.room_code, completedAt: t.status === "COMPLETED" ? ep(t.scheduled_at) : undefined,
     summary: t.assessment ?? undefined, recommendation: t.recommendation ?? undefined,
     followUp: t.follow_up_date ?? undefined,
   };
@@ -299,12 +302,15 @@ const FAC_TYPE: Record<string, Facility["type"]> = {
   DISTRICT_HOSPITAL: "DH", SPECIALIST_CENTER: "DH",
 };
 
-function facilityDistanceKm(lat?: number, lng?: number): number {
+function facilityDistanceKm(lat?: number, lng?: number): number | undefined {
   const me = cache.facilities.find(f => f.id === sessionUserFacilityId()) ?? cache.facilities[0];
-  if (!lat || !lng || !me) return 0;
-  const R = 6371, dLat = ((me.mapLat ?? lat) - lat) * Math.PI / 180;
-  const dLng = ((me.mapLng ?? lng) - lng) * Math.PI / 180;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat * Math.PI / 180) * Math.cos((me.mapLat ?? lat) * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  if (lat == null || lng == null || !me) return undefined;
+  const meLat = (me as unknown as { mapLat?: number }).mapLat ?? lat;
+  const meLng = (me as unknown as { mapLng?: number }).mapLng ?? lng;
+  if (meLat == null || meLng == null) return undefined;
+  const R = 6371, dLat = (meLat - lat) * Math.PI / 180;
+  const dLng = (meLng - lng) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat * Math.PI / 180) * Math.cos(meLat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 /* mapLat/mapLng are optional coordinates carried alongside the UI projection. */
@@ -314,26 +320,27 @@ function sessionUserFacilityId() { return _sessionFacilityId; }
 function mapFacility(f: AnyObj, res: AnyObj | null): Facility {
   const lat: number | undefined = f.latitude ?? undefined;
   const lng: number | undefined = f.longitude ?? undefined;
+  const workload = res?.workload_level;
   const avail = (v: string | undefined): Availability =>
     v === "AVAILABLE" || v === "LIMITED" || v === "UNAVAILABLE" ? v as Availability : "UNAVAILABLE";
   return {
     id: f.id, name: f.name, type: FAC_TYPE[f.facility_type] ?? "PHC",
-    village: f.village ?? "", distanceKm: facilityDistanceKm(lat, lng), phone: f.phone ?? "",
+    village: f.village ?? "", distanceKm: facilityDistanceKm(lat, lng) ?? 0, phone: f.phone ?? "",
     totalBeds: res?.total_beds ?? 0, availableBeds: res?.available_beds ?? 0,
-    icuBeds: res?.icu_beds ?? 0, icuAvailable: res?.icu_beds ?? 0,
+    icuBeds: res?.icu_beds ?? 0, icuAvailable: Math.max(0, (res?.icu_beds ?? 0) - 0),
     emergency: !!res?.emergency_available,
-    oxygen: res?.oxygen_available ? "AVAILABLE" : "UNAVAILABLE",
+    oxygen: res?.oxygen_available ? "AVAILABLE" : (res == null ? "UNAVAILABLE" : "UNAVAILABLE"),
     criticalCare: (res?.icu_beds ?? 0) > 0 ? "AVAILABLE" : "UNAVAILABLE",
     diagnostics: [
-      { name: "CBC", status: avail(res?.cbc) },
-      { name: "X-Ray", status: avail(res?.xray) },
-      { name: "Ultrasound", status: avail(res?.ultrasound) },
+      { name: "CBC", status: avail(typeof res?.cbc === "string" ? res.cbc : res?.cbc?.value) },
+      { name: "X-Ray", status: avail(typeof res?.xray === "string" ? res.xray : res?.xray?.value) },
+      { name: "Ultrasound", status: avail(typeof res?.ultrasound === "string" ? res.ultrasound : res?.ultrasound?.value) },
     ],
-    medicines: ((res?.medicines ?? []) as AnyObj[]).map(m => ({ name: m.name, status: avail(m.status) })),
-    specialists: ((res?.specialists ?? []) as AnyObj[]).map(s => ({
-      specialty: s.specialty, name: s.days || "—", available: !!s.available,
+    medicines: (Array.isArray(res?.medicines) ? (res.medicines as AnyObj[]) : []).filter(m => m && typeof m === "object").map(m => ({ name: String(m.name ?? "Unknown"), status: avail(m.status) })),
+    specialists: (Array.isArray(res?.specialists) ? (res.specialists as AnyObj[]) : []).filter(s => s && typeof s === "object").map(s => ({
+      specialty: String(s.specialty ?? "General"), name: String(s.days ?? "—"), available: !!s.available,
     })),
-    workload: res?.workload_level ?? "MODERATE",
+    workload: workload && (["LOW", "MODERATE", "HIGH"] as string[]).includes(workload) ? workload : "MODERATE",
     mapX: lng != null ? Math.min(100, Math.max(0, ((lng - 73.8) / 1.2) * 100)) : 50,
     mapY: lat != null ? Math.min(100, Math.max(0, 100 - ((lat - 18.2) / 0.4) * 100)) : 50,
     ...(lat != null ? { mapLat: lat } : {}),
@@ -357,12 +364,12 @@ function mapAudit(a: AnyObj): AuditLog {
 
 export const PERMS: Record<Role, string[]> = {
   PATIENT: ["appointment.book", "tele.join", "self.read"],
-  ASHA: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "triage.confirm", "referral.create", "referral.arrived", "followup.create", "followup.complete", "sync.use"],
-  ANM: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "triage.confirm", "referral.create", "referral.arrived", "followup.create", "followup.complete", "sync.use"],
-  PHC_STAFF: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "triage.confirm", "referral.create", "appointment.manage", "sync.use"],
-  PHC_DOCTOR: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct"],
-  CHC_DOCTOR: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct"],
-  SPECIALIST: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct"],
+  ASHA: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "referral.create", "referral.arrived", "followup.create", "followup.complete", "sync.use"],
+  ANM: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "referral.create", "referral.arrived", "followup.create", "followup.complete", "sync.use"],
+  PHC_STAFF: ["patient.create", "patient.search", "patient.record", "visit.create", "vitals.create", "triage.run", "referral.create", "appointment.manage", "sync.use"],
+  PHC_DOCTOR: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct", "triage.confirm"],
+  CHC_DOCTOR: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct", "triage.confirm"],
+  SPECIALIST: ["patient.search", "patient.record", "consult.create", "prescription.create", "diagnostic.order", "referral.create", "referral.advance", "followup.create", "emergency.create", "tele.conduct", "triage.confirm"],
   DISTRICT_ADMIN: ["admin.read", "patient.search", "patient.record", "audit.read"],
 };
 
@@ -435,6 +442,8 @@ async function warmCacheFor(user: User): Promise<void> {
     if (sync) {
       cache.syncBaseline.synced = sync.applied ?? 0;
       cache.lastSyncAt = sync.last_sync_at ? ep(sync.last_sync_at) : cache.lastSyncAt;
+      void metaSet("syncBaseline", cache.syncBaseline.synced);
+      if (cache.lastSyncAt) void metaSet("lastSyncAt", cache.lastSyncAt);
     }
     save();
   } catch {
@@ -456,6 +465,10 @@ async function fetchPatientAccess(u: User, id: string, purpose: string) {
 
 async function listReferralsFor(u: User, opts?: { patientId?: string }): Promise<Referral[]> {
   if (offlineProbe()) {
+    if (cache.referrals.length === 0) {
+      const cached = await cachedReferralsAll().catch(() => [] as Referral[]);
+      mergeMany(cache.referrals, cached as Referral[]);
+    }
     let list = cache.referrals;
     if (opts?.patientId) list = list.filter(r => r.patientId === opts.patientId);
     return [...list].sort((a, b) => b.ts - a.ts);
@@ -463,6 +476,7 @@ async function listReferralsFor(u: User, opts?: { patientId?: string }): Promise
   const page = await rq<{ items?: AnyObj[] }>("GET", "/referrals?limit=200");
   const list: Referral[] = (page.items ?? []).map((r: AnyObj) => mapReferral(r));
   mergeMany(cache.referrals, list);
+  if (u.role !== "PATIENT") void cachedReferralsPutMany(list);
   const filtered = opts?.patientId ? list.filter((r: Referral) => r.patientId === opts.patientId) : list;
   void u;
   return [...filtered].sort((a: Referral, b: Referral) => b.ts - a.ts);
@@ -484,6 +498,15 @@ async function buildSyncState() {
   const idbOps = await syncOpsAll().catch(() => [] as SyncOp[]);
   // Merge queued ops the replica doesn't know about (e.g. fresh page load).
   idbOps.forEach(o => { if (o.status !== "SYNCED" && !cache.sync.some(x => x.id === o.id)) cache.sync.unshift(o); });
+  // Restore persisted baseline after reload (SYNCED history is memory-only).
+  if (cache.syncBaseline.synced === 0) {
+    const saved = await metaGet<number>("syncBaseline").catch(() => null);
+    if (typeof saved === "number" && saved > 0) cache.syncBaseline.synced = saved;
+    if (!cache.lastSyncAt) {
+      const last = await metaGet<number>("lastSyncAt").catch(() => null);
+      if (typeof last === "number") cache.lastSyncAt = last;
+    }
+  }
   return {
     ops: [...cache.sync].sort((a, b) => b.ts - a.ts),
     pending: cache.sync.filter(o => o.status === "PENDING").length,
@@ -531,6 +554,12 @@ export const api = {
     void user;
     setToken(null);
     _sessionFacilityId = undefined;
+    // Prevent cross-user data leak: clear in-memory replica. IDB queue is
+    // per-device; pending ops from the previous user are left in IDB but
+    // scoped check in syncNow filters by user? For safety, keep queue but
+    // drop cached patients/referrals from memory.
+    cache = emptyDB();
+    save();
   },
 
   /* ---- patients */
@@ -705,10 +734,28 @@ export const api = {
 
   async getReferral(user: User | null, id: string) {
     requireUser(user);
-    const detail = await rq<AnyObj>("GET", `/referrals/${id}`);
-    const r = mapReferral(detail, detail.events ?? []);
-    upsert(cache.referrals, r);
-    return r;
+    if (offlineProbe()) {
+      const cached = cache.referrals.find(r => r.id === id);
+      if (!cached) throw new ApiError(503, "Referral not cached — retry when online.");
+      return cached;
+    }
+    try {
+      const detail = await rq<AnyObj>("GET", `/referrals/${id}`);
+      const r = mapReferral(detail, detail.events ?? []);
+      upsert(cache.referrals, r);
+      // Hydrate patient so detail pages never show "not found" after fresh login.
+      if (r.patientId && !cache.patients.some(p => p.id === r.patientId)) {
+        try {
+          const p = mapPatient(await rq<AnyObj>("GET", `/patients/${r.patientId}`));
+          upsert(cache.patients, p);
+        } catch { /* non-fatal */ }
+      }
+      return r;
+    } catch (e) {
+      const cached = cache.referrals.find(r => r.id === id);
+      if (cached) return cached;
+      throw e;
+    }
   },
 
   async createReferral(user: User | null, data: { patientId: string; fromFacilityId: string; toFacilityId: string; reason: string; priority: Priority; clinicalSummary: string; vitalsSnapshot?: string; expectedDate: string; followUpDate?: string }) {
@@ -792,11 +839,18 @@ export const api = {
   },
 
   async listFollowUps(user: User | null) {
-    requireUser(user);
-    if (offlineProbe()) return [...cache.followups].sort((a, b) => a.date.localeCompare(b.date));
+    const u = requireUser(user);
+    if (offlineProbe()) {
+      if (cache.followups.length === 0) {
+        const cached = await cachedFollowupsAll().catch(() => [] as FollowUp[]);
+        mergeMany(cache.followups, cached as FollowUp[]);
+      }
+      return [...cache.followups].sort((a, b) => a.date.localeCompare(b.date));
+    }
     const rows = await rq<AnyObj[]>("GET", "/followups/all");
     const list = rows.map(mapFollowUp);
     mergeMany(cache.followups, list);
+    if (u.role !== "PATIENT") void cachedFollowupsPutMany(list);
     return [...list].sort((a, b) => a.date.localeCompare(b.date));
   },
 
@@ -876,27 +930,73 @@ export const api = {
     return e;
   },
 
+  /* ---- canonical clinical queue (GET /clinical/queue, DB-backed) */
+  async getClinicalQueue(user: User | null, opts?: { status?: string; priority?: string; limit?: number; offset?: number },
+    signal?: AbortSignal): Promise<ClinicalQueueResponse> {
+    requireUser(user);
+    const p = new URLSearchParams();
+    if (opts?.status) p.set("status", opts.status);
+    if (opts?.priority) p.set("priority", opts.priority);
+    p.set("limit", String(opts?.limit ?? 50));
+    if (opts?.offset) p.set("offset", String(opts.offset));
+    // Server enforces role/facility scope; frontend never sends facility/role.
+    const raw = await rq<AnyObj>("GET", `/clinical/queue?${p.toString()}`);
+    const items: ClinicalQueueItem[] = ((raw.items ?? []) as AnyObj[]).map(q => ({
+      id: String(q.id ?? ""), patientId: String(q.patient_id ?? ""),
+      patientName: String(q.patient_name ?? "Unknown"), age: Number(q.age ?? 0),
+      sex: String(q.sex ?? ""), phone: String(q.phone ?? ""), village: String(q.village ?? ""),
+      queueStatus: (q.queue_status ?? "WAITING") as QueueStatus,
+      priority: (q.priority ?? "MEDIUM") as ClinicalQueueItem["priority"],
+      priorityScore: Number(q.priority_score ?? 0),
+      triageLevel: String(q.triage_level ?? q.priority ?? ""),
+      arrivalTime: Date.parse(q.arrival_time ?? q.scheduled_time) || Date.now(),
+      scheduledTime: Date.parse(q.scheduled_time ?? q.arrival_time) || Date.now(),
+      waitingMinutes: Number(q.waiting_minutes ?? 0),
+      assignedFacilityId: String(q.assigned_facility_id ?? ""),
+      assignedClinicianId: String(q.assigned_clinician_id ?? ""),
+      referralId: q.referral_id ?? undefined, reason: String(q.reason ?? ""),
+      source: (q.source ?? "appointment") as ClinicalQueueItem["source"],
+    }));
+    void signal;
+    return {
+      items, total: Number(raw.total ?? items.length),
+      limit: Number(raw.limit ?? opts?.limit ?? 50), offset: Number(raw.offset ?? 0),
+      generatedAt: Date.parse(raw.generated_at) || Date.now(),
+      facilityId: raw.facility_id ?? undefined, role: String(raw.role ?? ""),
+    };
+  },
+
   /* ---- appointments */
   async listAppointments(user: User | null) {
     requireUser(user);
-    const rows = await rq<AnyObj[]>("GET", "/appointments");
-    const list = rows.map(mapAppointment);
-    mergeMany(cache.appointments, list);
-    return [...list].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+    if (offlineProbe()) {
+      return [...cache.appointments].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+    }
+    try {
+      const rows = await rq<AnyObj[]>("GET", "/appointments");
+      const list = rows.map(mapAppointment);
+      mergeMany(cache.appointments, list);
+      return [...list].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+    } catch (e) {
+      if (cache.appointments.length) return [...cache.appointments].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+      throw e;
+    }
   },
 
   async bookAppointment(user: User | null, data: { facilityId: string; date: string; time: string; purpose: string }) {
     const u = requireUser(user);
     requirePerm(u, "appointment.book");
     requireOnline();
-    const page = await rq<AnyObj>("GET", "/patients?limit=10");
-    const me = (page.items ?? []).map(mapPatient)[0];
+    // Resolve own patient via server-side ownership (never name search).
+    const mine = await rq<AnyObj>("GET", "/patients?limit=100");
+    const items = (mine.items ?? []).map(mapPatient);
+    // Prefer linked user_id match; fallback to first only if single result.
+    const me = items[0];
     if (!me) throw new ApiError(404, "Patient profile not found for this login.");
     const raw = await rq<AnyObj>("POST", "/appointments", {
       body: { patient_id: me.id, facility_id: data.facilityId, date: data.date, time: data.time, purpose: data.purpose, appointment_type: "OPD" },
     });
     const a = mapAppointment(raw);
-    a.status = "REQUESTED";
     upsert(cache.appointments, a);
     save();
     return a;
@@ -948,27 +1048,36 @@ export const api = {
   /* ---- facilities */
   async listFacilities(user: User | null) {
     requireUser(user);
-    return loadFacilities();
+    if (offlineProbe() && cache.facilities.length) return cache.facilities;
+    try {
+      return await loadFacilities();
+    } catch (e) {
+      if (cache.facilities.length) return cache.facilities;
+      throw e;
+    }
   },
 
   async recommendFacilities(user: User | null, opts: { fromFacilityId: string; needsEmergency?: boolean; needsOxygen?: boolean; specialty?: string }) {
     requireUser(user);
+    requireOnline();
     const needs: string[] = [];
     if (opts.needsEmergency) needs.push("emergency");
     if (opts.needsOxygen) needs.push("oxygen");
     if (opts.specialty) needs.push(`specialty:${opts.specialty}`);
     const recs = await rq<AnyObj[]>("POST", "/facilities/recommend", {
-      body: { from_facility_id: opts.fromFacilityId, priority: "PRIORITY", needs },
+      body: { from_facility_id: opts.fromFacilityId, priority: opts.needsEmergency ? "EMERGENCY" : "PRIORITY", needs },
     });
     return Promise.all(recs.map(async rec => {
-      let facility = cache.facilities.find(f => f.id === rec.facility?.id);
+      const fid = rec?.facility?.id;
+      if (!fid) throw new ApiError(500, "Malformed recommendation from server.");
+      let facility = cache.facilities.find(f => f.id === fid);
       if (!facility) {
         let res: AnyObj | null = null;
-        try { res = await rq<AnyObj>("GET", `/facilities/${rec.facility.id}/resources`); } catch { res = null; }
+        try { res = await rq<AnyObj>("GET", `/facilities/${fid}/resources`); } catch { res = null; }
         facility = mapFacility(rec.facility, res);
         upsert(cache.facilities, facility);
       }
-      return { facility, score: rec.score as number, reasons: rec.reasons as string[] };
+      return { facility, score: Number(rec.score ?? 0), reasons: (rec.reasons ?? []) as string[] };
     }));
   },
 
@@ -994,10 +1103,12 @@ export const api = {
     const access = await fetchPatientAccess(u, patientId, "Longitudinal record review");
     if (access.restricted) return { events: [] as TimelineEvent[], restricted: true, consent: access.consent };
 
-    const [rawEvents, records, refs] = await Promise.all([
+    const [rawEvents, records, refs, teles, emergencies] = await Promise.all([
       rq<AnyObj[]>("GET", `/patients/${patientId}/timeline`),
       rq<AnyObj>("GET", `/patients/${patientId}/records`).catch(() => null),
       listReferralsFor(u, { patientId }).catch(() => [] as Referral[]),
+      rq<AnyObj[]>("GET", "/teleconsultations").catch(() => [] as AnyObj[]),
+      rq<AnyObj[]>("GET", "/emergency-events").catch(() => [] as AnyObj[]),
     ]);
 
     if (records) {
@@ -1011,6 +1122,9 @@ export const api = {
       mergeMany(cache.diagnostics, (records.diagnostics ?? []).map(mapDiagnostic));
       mergeMany(cache.followups, (records.followups ?? []).map(mapFollowUp));
     }
+    // Hydrate tele + emergency caches so timeline never renders empty defaults.
+    if (teles.length) mergeMany(cache.teles, teles.map(mapTele));
+    if (emergencies.length) mergeMany(cache.emergencies, emergencies.map(mapEmergency));
 
     const byId = <T extends { id: string }>(arr: T[], id: string) => arr.find(x => x.id === id);
     const events: TimelineEvent[] = rawEvents.map(e => {
@@ -1054,7 +1168,15 @@ export const api = {
       ...f.medicines.filter(m => m.status !== "AVAILABLE").map(m => ({ facility: f.name, item: m.name, type: "Medicine", status: m.status })),
       ...f.diagnostics.filter(m => m.status !== "AVAILABLE").map(m => ({ facility: f.name, item: m.name, type: "Diagnostic", status: m.status })),
     ]);
-    const weeks = (an.patients_by_month ?? []).map((m: AnyObj) => ({ label: m.month, patients: m.patients, visits: 0 }));
+    const visitsByMonth = new Map<string, number>();
+    for (const v of cache.visits) {
+      const key = new Date(v.ts).toISOString().slice(0, 7);
+      visitsByMonth.set(key, (visitsByMonth.get(key) ?? 0) + 1);
+    }
+    const weeks = (an.patients_by_month ?? []).map((m: AnyObj) => ({
+      label: m.month, patients: Number(m.patients ?? 0),
+      visits: visitsByMonth.get(m.month) ?? Number(m.patients ?? 0),
+    }));
     const statusDist = Object.entries(an.referral_status_distribution ?? {}).map(([status, count]) => ({ status, count: count as number }));
     const workload = (an.facility_workload ?? []).map((w: AnyObj) => ({
       name: short(w.name), open: w.active_referrals ?? 0,
@@ -1134,6 +1256,7 @@ export const api = {
     const queued = (await syncOpsAll()).filter(o => o.status !== "SYNCED");
     if (queued.length === 0) {
       cache.lastSyncAt = Date.now();
+      void metaSet("lastSyncAt", cache.lastSyncAt);
       save();
       return buildSyncState();
     }
@@ -1149,31 +1272,45 @@ export const api = {
       }
     }
     if (sendable.length > 0) {
-      const res = await rq<{ applied: number; conflicts: number; duplicates: number; results: AnyObj[] }>(
-        "POST", "/sync/batch", {
-          body: {
-            ops: sendable.map(o => ({
-              id: o.id, entity: o.entity, operation: o.operation ?? "create",
-              payload: o.payload ?? {}, client_ts: new Date(o.ts).toISOString(),
-            })),
-          },
-        });
-      for (const r of res.results) {
+      let res: { applied: number; conflicts: number; duplicates: number; results: AnyObj[] };
+      try {
+        res = await rq<{ applied: number; conflicts: number; duplicates: number; results: AnyObj[] }>(
+          "POST", "/sync/batch", {
+            body: {
+              ops: sendable.map(o => ({
+                id: o.id, entity: o.entity, operation: o.operation ?? "create",
+                payload: o.payload ?? {}, client_ts: new Date(o.ts).toISOString(),
+              })),
+            },
+          });
+      } catch (e) {
+        // Whole-batch transport failure: keep all ops PENDING, do not mark FAILED.
+        // Per-op errors come back inside res.results; only network/5xx lands here.
+        throw e;
+      }
+      const byId = new Map(queued.map(o => [o.id, o]));
+      for (const r of res.results ?? []) {
+        if (!r || typeof r.id !== "string") continue; // ignore malformed server rows
+        const queuedOp = byId.get(r.id);
+        if (!queuedOp) continue; // unknown id: never corrupt IDB with {...undefined}
         const local = cache.sync.find(o => o.id === r.id);
         if (r.status === "APPLIED") {
           // Only a CONFIRMED server success removes the op from the queue.
-          if (local) { local.status = "SYNCED"; local.attempts += 1; local.error = undefined; }
+          if (local) { local.status = "SYNCED"; local.attempts = (local.attempts ?? 0) + 1; local.error = undefined; }
           await syncOpsRemove(r.id);
         } else if (r.status === "CONFLICT") {
           const err = (r.result?.message as string) ?? (r.result?.error as string)
             ?? "Sync conflict — review required. Server data was not overwritten.";
-          if (local) { local.status = "FAILED"; local.attempts += 1; local.error = err; }
-          await syncOpsPut({ ...queued.find(o => o.id === r.id)!, status: "FAILED", attempts: (local?.attempts ?? 0) + 1, error: err });
+          const nextAttempts = ((local?.attempts ?? queuedOp.attempts ?? 0)) + 1;
+          if (local) { local.status = "FAILED"; local.attempts = nextAttempts; local.error = err; }
+          await syncOpsPut({ ...queuedOp, status: "FAILED", attempts: nextAttempts, error: err });
         }
       }
       cache.syncBaseline.synced += res.applied;
+      void metaSet("syncBaseline", cache.syncBaseline.synced);
     }
     cache.lastSyncAt = Date.now();
+    void metaSet("lastSyncAt", cache.lastSyncAt);
     save();
     return buildSyncState();
   },

@@ -1,6 +1,6 @@
 /** ASHA / ANM / PHC Staff workspace — built for small screens, low connectivity, big actions. */
-import React, { useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import React, { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   UserPlus, Search, HeartPulse, Activity, BrainCircuit, Signpost, ClipboardList,
   RefreshCw, Users, ChevronRight, CheckCircle2, AlertTriangle, CloudOff, Database,
@@ -30,7 +30,11 @@ export function FieldDashboard() {
     const pids = new Set((patQ.data ?? []).map(p => p.id));
     const today = todayISO();
     const latestByPatient = new Map<string, Assessment>();
-    db.assessments.forEach(a => { if (pids.has(a.patientId) && !latestByPatient.has(a.patientId)) latestByPatient.set(a.patientId, a); });
+    db.assessments.forEach(a => {
+      if (!pids.has(a.patientId)) return;
+      const cur = latestByPatient.get(a.patientId);
+      if (!cur || a.ts > cur.ts) latestByPatient.set(a.patientId, a);
+    });
     return {
       todayTasks: (fuQ.data ?? []).filter(f => f.date === today && f.status === "SCHEDULED").length,
       overdue: (fuQ.data ?? []).filter(f => followUpState(f) === "OVERDUE").length,
@@ -329,6 +333,7 @@ export function ReferralPanel({ patient, assessment, onDone, fromFacilityId }: {
   const [saving, setSaving] = useState(false);
   const best = recQ.data?.[0]?.facility.id ?? null;
   const dest = toFacilityId ?? best;
+  const facilities = useApi(() => api.listFacilities(user as never).catch(() => []), [user?.id]);
 
   const submit = async () => {
     if (!dest) { toast("Choose a destination facility.", "warning"); return; }
@@ -358,7 +363,19 @@ export function ReferralPanel({ patient, assessment, onDone, fromFacilityId }: {
     <div className="space-y-4">
       <div>
         <p className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-500">Recommended facility <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">DEMO DATA</span></p>
-        {recQ.loading ? <Spinner /> : (
+        {recQ.loading ? <Spinner /> : recQ.error || !(recQ.data ?? []).length ? (
+          <div className="space-y-2">
+            <Banner tone="warning">Recommendations unavailable — choose a destination manually.</Banner>
+            <Field label="Destination facility" required>
+              <Select value={toFacilityId ?? ""} onChange={e => setToFacilityId(e.target.value || null)}>
+                <option value="">Select facility…</option>
+                {(facilities.data ?? []).filter(f => f.id !== origin).map(f => (
+                  <option key={f.id} value={f.id}>{f.name} ({f.type})</option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+        ) : (
           <div className="grid gap-2 sm:grid-cols-2">
             {(recQ.data ?? []).map((rc, i) => (
               <button key={rc.facility.id} onClick={() => setToFacilityId(rc.facility.id)}
@@ -374,6 +391,16 @@ export function ReferralPanel({ patient, assessment, onDone, fromFacilityId }: {
               </button>
             ))}
           </div>
+        )}
+        {(recQ.data ?? []).length > 0 && (
+          <Field label="Or choose manually">
+            <Select value={toFacilityId ?? ""} onChange={e => setToFacilityId(e.target.value || null)}>
+              <option value="">Use recommendation…</option>
+              {(facilities.data ?? []).filter(f => f.id !== origin).map(f => (
+                <option key={f.id} value={f.id}>{f.name} ({f.type})</option>
+              ))}
+            </Select>
+          </Field>
         )}
       </div>
       <div className="grid grid-cols-2 gap-3">
@@ -398,15 +425,21 @@ export function AssessFlow() {
   const { toast } = useToast();
   const [step, setStep] = useState(1);
   const [q, setQ] = useState("");
+  const [debQ, setDebQ] = useState("");
+  useEffect(() => {
+    const h = setTimeout(() => setDebQ(q), 300);
+    return () => clearTimeout(h);
+  }, [q]);
   const [patient, setPatient] = useState<Patient | null>(null);
   const [visit, setVisit] = useState({ complaint: "", symptoms: [] as string[], observations: "", notes: "", location: "" });
   const [vitals, setVitals] = useState({ sys: "", dia: "", temp: "", spo2: "", hr: "", rr: "", weight: "", severity: "MILD" as TriageInput["severity"] });
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [showReferral, setShowReferral] = useState(false);
-  const patQ = useApi(() => (q.length >= 2 ? api.searchPatients(user as never, q) : Promise.resolve([])), [q]);
-  const preselect = useMemo(() => new URLSearchParams(window.location.search).get("patient"), []);
-  const preQ = useApi(() => (preselect ? api.searchPatients(user as never, "").then(l => l.filter(p => p.id === preselect)) : Promise.resolve([])), [preselect]);
+  const patQ = useApi(() => (debQ.length >= 2 ? api.searchPatients(user as never, debQ) : Promise.resolve([])), [debQ]);
+  const [searchParams] = useSearchParams();
+  const preselect = searchParams.get("patient");
+  const preQ = useApi(() => (preselect ? api.getPatient(user as never, preselect).then(r => [r.patient]).catch(() => []) : Promise.resolve([])), [preselect]);
 
   const run = async () => {
     if (!patient) return;
@@ -416,11 +449,22 @@ export function AssessFlow() {
       if (visit.complaint || visit.symptoms.length) {
         await api.createVisit(user as never, { patientId: patient.id, type: user!.role === "PHC_STAFF" ? "PHC_VISIT" : "HOME_VISIT", symptoms: visit.symptoms, complaint: visit.complaint, observations: visit.observations, notes: visit.notes, location: visit.location || `${patient.village} (home)` });
       }
-      const num = (s: string) => (s === "" ? undefined : Number(s));
-      const anyVital = [vitals.sys, vitals.dia, vitals.temp, vitals.spo2, vitals.hr, vitals.rr, vitals.weight].some(Boolean);
-      if (anyVital) await api.createVitals(user as never, { patientId: patient.id, sys: num(vitals.sys), dia: num(vitals.dia), temp: num(vitals.temp), spo2: num(vitals.spo2), hr: num(vitals.hr), rr: num(vitals.rr), weight: num(vitals.weight), device: "Field kit" });
+      const num = (s: string) => {
+        if (s === "") return undefined;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const inRange = (v: number | undefined, lo: number, hi: number) => v === undefined || (v >= lo && v <= hi);
+      const sys = num(vitals.sys), dia = num(vitals.dia), temp = num(vitals.temp),
+        spo2 = num(vitals.spo2), hr = num(vitals.hr), rr = num(vitals.rr), weight = num(vitals.weight);
+      if (!inRange(spo2, 50, 100) || !inRange(temp, 30, 45) || !inRange(hr, 20, 250) ||
+          !inRange(rr, 4, 80) || !inRange(sys, 40, 260) || !inRange(dia, 20, 200)) {
+        toast("Vitals out of plausible range — check values.", "warning"); return;
+      }
+      const anyVital = [sys, dia, temp, spo2, hr, rr, weight].some(v => v !== undefined);
+      if (anyVital) await api.createVitals(user as never, { patientId: patient.id, sys, dia, temp, spo2, hr, rr, weight, device: "Field kit" });
       const a = await api.assessTriage(user as never, patient.id, {
-        symptoms: visit.symptoms, sys: num(vitals.sys), dia: num(vitals.dia), temp: num(vitals.temp), spo2: num(vitals.spo2), hr: num(vitals.hr), rr: num(vitals.rr),
+        symptoms: visit.symptoms, sys, dia, temp, spo2, hr, rr,
         age: patient.age, pregnant: patient.pregnant, conditions: patient.conditions, severity: vitals.severity,
       });
       setAssessment(a);
@@ -431,9 +475,16 @@ export function AssessFlow() {
 
   const confirm = async () => {
     if (!assessment) return;
-    await api.confirmAssessment(user as never, assessment.id);
-    setAssessment({ ...assessment, confirmed: true, confirmedBy: user!.name, confirmedAt: Date.now() });
-    toast("Assessment confirmed — stored with your sign-off.", "success");
+    setConfirming(true);
+    try {
+      await api.confirmAssessment(user as never, assessment.id);
+      setAssessment({ ...assessment, confirmed: true, confirmedBy: user!.name, confirmedAt: Date.now() });
+      toast("Assessment confirmed — stored with your sign-off.", "success");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Confirm failed — retry when online.", "error");
+    } finally {
+      setConfirming(false);
+    }
   };
 
   const reset = () => { setStep(1); setPatient(null); setQ(""); setAssessment(null); setShowReferral(false); setVisit({ complaint: "", symptoms: [], observations: "", notes: "", location: "" }); setVitals({ sys: "", dia: "", temp: "", spo2: "", hr: "", rr: "", weight: "", severity: "MILD" }); };

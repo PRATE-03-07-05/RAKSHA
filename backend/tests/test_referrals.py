@@ -12,10 +12,11 @@ def _setup(db):
     seed_facilities(db)
     asha = make_user(db, Role.ASHA, email="ref-asha@test.raksha", facility_id=PHC)
     phc_staff = make_user(db, Role.PHC_STAFF, email="ref-staff@test.raksha", facility_id=PHC)
+    chc_staff = make_user(db, Role.PHC_STAFF, email="ref-chc-staff@test.raksha", facility_id=CHC)
     phc_dr = make_user(db, Role.PHC_DOCTOR, email="ref-phcdr@test.raksha", facility_id=PHC)
     chc_dr = make_user(db, Role.CHC_DOCTOR, email="ref-chcdr@test.raksha", facility_id=CHC)
     patient = make_patient(db, asha_id=asha.id, phc_id=PHC)
-    return asha, phc_staff, phc_dr, chc_dr, patient
+    return asha, phc_staff, chc_staff, phc_dr, chc_dr, patient
 
 
 def _create(client, user, patient_id):
@@ -38,10 +39,10 @@ def test_create_referral_starts_sent_with_history(client, db):
 
 
 def test_full_lifecycle_to_completion(client, db):
-    asha, phc_staff, phc_dr, chc_dr, patient = _setup(db)
+    asha, _phc_staff, chc_staff, _phc_dr, chc_dr, patient = _setup(db)
     rid = _create(client, asha, patient.id).json()["id"]
 
-    ack = client.post(f"/referrals/{rid}/transition", headers=auth_headers(phc_staff),
+    ack = client.post(f"/referrals/{rid}/transition", headers=auth_headers(chc_staff),
                       json={"target": "ACKNOWLEDGED", "notes": "bed available"})
     assert ack.status_code == 200 and ack.json()["status"] == "ACKNOWLEDGED"
 
@@ -75,7 +76,7 @@ def test_invalid_transition_rejected(client, db):
 
 
 def test_unauthorized_transition_rejected(client, db):
-    asha, _phc_staff, phc_dr, _chc_dr, patient = _setup(db)
+    asha, _phc_staff, _chc_staff, phc_dr, _chc_dr, patient = _setup(db)
     rid = _create(client, asha, patient.id).json()["id"]
     # Source-facility doctor cannot acknowledge — only the receiving facility can.
     r = client.post(f"/referrals/{rid}/transition", headers=auth_headers(phc_dr),
@@ -88,7 +89,7 @@ def test_unauthorized_transition_rejected(client, db):
 
 
 def test_completion_requires_outcome(client, db):
-    asha, _phc_staff, _phc_dr, chc_dr, patient = _setup(db)
+    asha, _phc_staff, _chc_staff, _phc_dr, chc_dr, patient = _setup(db)
     rid = _create(client, asha, patient.id).json()["id"]
     for t in ("ACKNOWLEDGED", "ACCEPTED", "ARRIVED", "IN_CONSULTATION", "TREATMENT"):
         r = client.post(f"/referrals/{rid}/transition", headers=auth_headers(chc_dr), json={"target": t})

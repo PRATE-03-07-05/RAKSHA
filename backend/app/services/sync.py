@@ -12,6 +12,7 @@ Contract with the frontend (IndexedDB sync queue):
 from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..audit import AuditAction, log_action
@@ -27,6 +28,21 @@ _CREATORS = {
     "referral": Referral,
 }
 
+# Explicit allowlists — clients may never set ownership, version, outcome,
+# status or timestamps directly. Ownership is forced to the syncing user.
+_ALLOWED_FIELDS: dict[str, set[str]] = {
+    "visit": {"id", "patient_id", "facility_id", "location", "symptoms",
+              "complaint", "observations", "notes"},
+    "vital": {"id", "patient_id", "facility_id", "systolic", "diastolic",
+              "temperature", "spo2", "heart_rate", "respiratory_rate",
+              "weight_kg", "device", "recorded_at"},
+    "followup": {"id", "patient_id", "referral_id", "scheduled_date",
+                 "notes", "assignee_role"},
+    "referral": {"id", "patient_id", "from_facility_id", "to_facility_id",
+                 "reason", "priority", "clinical_summary", "vitals_snapshot",
+                 "expected_date"},
+}
+
 
 def _apply_assessment(db: Session, user: User, op, payload: dict[str, Any]) -> dict[str, Any]:
     """Assessments captured offline are re-evaluated SERVER-SIDE on sync.
@@ -40,9 +56,19 @@ def _apply_assessment(db: Session, user: User, op, payload: dict[str, Any]) -> d
     from .triage import assess_with_fallback, persist
 
     raw = payload.get("input") or payload.get("input_snapshot") or {}
+    # Missing age must not masquerade as age 0 (which triages as infant risk).
+    # Use a neutral adult default when the client did not capture age.
+    _age_raw = raw.get("age")
+    try:
+        _age = int(_age_raw) if _age_raw not in (None, "") else 30
+    except (ValueError, TypeError):
+        _age = 30
+    _patient_id = payload.get("patient_id")
+    if not _patient_id or db.get(Patient, _patient_id) is None:
+        raise LookupError("patient not found for assessment")
     req = TriageRequest(
-        patient_id=payload.get("patient_id"),
-        age=int(raw.get("age") or 0),
+        patient_id=_patient_id,
+        age=_age,
         spo2=raw.get("spo2"), respiratory_rate=raw.get("rr"),
         temperature=raw.get("temp"), heart_rate=raw.get("hr"),
         cough=bool(raw.get("cough")), breathing_difficulty=bool(raw.get("breathing_difficulty")),
@@ -80,11 +106,34 @@ def _apply_one(db: Session, user: User, op) -> dict[str, Any]:
         model = _CREATORS.get(op.entity)
         if model is None:
             raise ValueError(f"Unsupported entity '{op.entity}'")
-        kwargs = {k: v for k, v in payload.items() if k not in {"workerName", "createdByName"}}
+        allowed = _ALLOWED_FIELDS.get(op.entity, set())
+        kwargs = {k: v for k, v in payload.items() if k in allowed}
+        # Ignore client-supplied id if it already exists (idempotent replay
+        # is handled via SyncOperation ledger, not PK collision).
+        _client_id = kwargs.pop("id", None)
+        if _client_id and db.get(model, _client_id) is not None:
+            raise ValueError(f"{op.entity} with this id already exists")
+        # Server-side ownership — never trust worker/creator ids from client.
+        if op.entity == "visit":
+            kwargs["worker_id"] = user.id
+            kwargs.setdefault("source", "SYNCED")
+            if "patient_id" in kwargs and db.get(Patient, kwargs["patient_id"]) is None:
+                raise LookupError("patient not found")
+        elif op.entity == "vital":
+            kwargs["recorded_by_id"] = user.id
+            kwargs.setdefault("source", "SYNCED")
+            if "patient_id" in kwargs and db.get(Patient, kwargs["patient_id"]) is None:
+                raise LookupError("patient not found")
+        elif op.entity == "followup":
+            if "patient_id" in kwargs and db.get(Patient, kwargs["patient_id"]) is None:
+                raise LookupError("patient not found")
         if op.entity == "referral":
             from .referrals import generate_code
-            kwargs.setdefault("code", generate_code(db))
-            kwargs.setdefault("status", ReferralStatus.SENT)
+            kwargs["code"] = generate_code(db)
+            kwargs["status"] = ReferralStatus.SENT
+            kwargs["created_by_id"] = user.id
+            if "patient_id" in kwargs and db.get(Patient, kwargs["patient_id"]) is None:
+                raise LookupError("patient not found")
         obj = model(**kwargs)
         db.add(obj)
         db.flush()
@@ -123,8 +172,10 @@ def apply_batch(db: Session, user: User, batch: SyncBatchIn) -> tuple[list[SyncO
         row = SyncOperation(id=op.id, user_id=user.id, entity=op.entity,
                             operation=op.operation, payload=op.payload,
                             client_ts=op.client_ts)
+        # Per-op isolation: one bad op must not abort the whole batch.
         try:
-            outcome = _apply_one(db, user, op)
+            with db.begin_nested():
+                outcome = _apply_one(db, user, op)
             if outcome.get("conflict"):
                 row.status = SyncStatus.CONFLICT
                 row.result = outcome
@@ -137,8 +188,14 @@ def apply_batch(db: Session, user: User, batch: SyncBatchIn) -> tuple[list[SyncO
             row.status = SyncStatus.CONFLICT
             row.result = {"error": str(e)}
             conflicts += 1
+        except IntegrityError as e:
+            row.status = SyncStatus.CONFLICT
+            row.result = {"error": f"Integrity conflict: {e.orig if hasattr(e, 'orig') else e}"}
+            conflicts += 1
         except (ValueError, TypeError) as e:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Op {op.id}: {e}")
+            row.status = SyncStatus.CONFLICT
+            row.result = {"error": f"Op {op.id}: {e}"}
+            conflicts += 1
 
         db.add(row)
         results.append(SyncOpOut.model_validate(row))

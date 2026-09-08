@@ -181,6 +181,12 @@ function ConnProvider({ children }: { children: React.ReactNode }) {
   }, [toast, t, refresh]);
 
   const retryFailed = useCallback(async () => {
+    // Reset attempts for FAILED ops so they become sendable again, then sync.
+    const { syncOpsAll, syncOpsPut } = await import("../lib/idb");
+    const ops = await syncOpsAll().catch(() => []);
+    for (const o of ops.filter(x => x.status === "FAILED")) {
+      await syncOpsPut({ ...o, status: "PENDING", attempts: 0, error: undefined });
+    }
     await syncNow();
   }, [syncNow]);
 
@@ -222,8 +228,9 @@ export function useApi<T>(fn: () => Promise<T>, deps: unknown[]): { data: T | nu
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const fnRef = useRef(fn);
-  fnRef.current = fn;
+  useEffect(() => { fnRef.current = fn; });
 
+  const depsKey = JSON.stringify(deps);
   useEffect(() => {
     let alive = true;
     setLoading(true);
@@ -233,10 +240,9 @@ export function useApi<T>(fn: () => Promise<T>, deps: unknown[]): { data: T | nu
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, tick]);
+  }, [depsKey, tick]);
 
-  useEffect(() => subscribe(() => setTick(x => x + 1)), []);
-
+  // No global subscribe-then-refetch storm: screens reload via explicit reload().
   return { data, loading, error, reload: () => setTick(x => x + 1) };
 }
 

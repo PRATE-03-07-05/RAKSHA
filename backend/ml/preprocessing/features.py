@@ -65,7 +65,8 @@ def request_to_record(req: Any) -> dict[str, Any]:
     schema layer and is trivially unit-testable.
     """
     conditions = list(getattr(req, "conditions", []) or [])
-    has_chronic = int(any(c.strip().lower() in _CHRONIC_KEYWORDS for c in conditions))
+    has_chronic = int(any(any(k in c.strip().lower() for k in _CHRONIC_KEYWORDS)
+                          for c in conditions if isinstance(c, str)))
     severity = (getattr(req, "severity_reported", None) or "MILD").upper()
     if severity not in SEVERITY_VALUES:
         severity = "MILD"

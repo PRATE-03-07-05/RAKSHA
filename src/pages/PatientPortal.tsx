@@ -15,7 +15,8 @@ import { fmtD, fmtDT, fmtTime, relTime, todayISO, cx } from "../lib/utils";
 
 function useSelfPatient() {
   const { user } = useAuth();
-  return useApi(() => api.searchPatients(user as never, user!.name).then(l => l[0] ?? null), [user?.id]);
+  // Server is authoritative: PATIENT list endpoint already scopes to own record.
+  return useApi(() => api.searchPatients(user as never, "").then(l => l[0] ?? null), [user?.id]);
 }
 
 /* ------------------------------------------------------------- patient home */
@@ -61,7 +62,7 @@ export function PatientHomePage() {
           </div>
         </div>
         <div className="grid grid-cols-2 gap-4 p-5 lg:grid-cols-4">
-          <StatCard label="Next appointment" value={upcoming ? fmtD(upcoming.date) : "—"} sub={upcoming ? `${upcoming.time} · ${facilityName(upcoming.facilityId)}` : "No appointment booked"} icon={<CalendarDays className="h-4 w-4" />} onClick={() => {}} />
+          <StatCard label="Next appointment" value={upcoming ? fmtD(upcoming.date) : "—"} sub={upcoming ? `${upcoming.time} · ${facilityName(upcoming.facilityId)}` : "No appointment booked"} icon={<CalendarDays className="h-4 w-4" />} onClick={() => window.location.assign("/app/appointments")} />
           <StatCard label="Active referral" value={activeRef ? activeRef.status.replace("_", " ") : "None"} sub={activeRef ? `${facilityName(activeRef.fromFacilityId)} → ${facilityName(activeRef.toFacilityId)}` : "All referrals closed"} icon={<Signpost className="h-4 w-4" />} tone={activeRef ? "amber" : "brand"} />
           <StatCard label="Follow-up" value={nextFu ? fmtD(nextFu.date) : "—"} sub={nextFu ? nextFu.notes.slice(0, 34) : "Nothing scheduled"} icon={<ClipboardList className="h-4 w-4" />} tone={nextFu ? "sky" : "slate"} />
           <StatCard label="Care status" value={myEmergency ? "Emergency" : latestAssessment?.level ?? "Stable"} sub={myEmergency ? "Emergency team alerted" : "Longitudinal record up to date"} icon={<Activity className="h-4 w-4" />} tone={myEmergency ? "red" : "brand"} />
@@ -117,11 +118,12 @@ export function AppointmentsPage() {
   const selfQ = useSelfPatient();
   const apQ = useApi(() => api.listAppointments(user as never), [user?.id]);
   const facQ = useApi(() => api.listFacilities(user as never), []);
-  const [form, setForm] = useState({ facilityId: "F-PHC-01", date: todayISO(1), time: "10:00", purpose: "" });
+  const [form, setForm] = useState({ facilityId: "", date: todayISO(1), time: "10:00", purpose: "" });
   const [saving, setSaving] = useState(false);
 
   const book = async () => {
     if (!form.purpose.trim()) { toast("Please describe the purpose of the visit.", "warning"); return; }
+    if (!form.facilityId) { toast("Choose a facility.", "warning"); return; }
     setSaving(true);
     try {
       await api.bookAppointment(user as never, form);
@@ -131,7 +133,7 @@ export function AppointmentsPage() {
     setSaving(false);
   };
 
-  const statusTone = { REQUESTED: "sky", CONFIRMED: "green", IN_QUEUE: "amber", COMPLETED: "slate", CANCELLED: "red" } as const;
+  const statusTone = { REQUESTED: "sky", SCHEDULED: "sky", CONFIRMED: "green", IN_QUEUE: "amber", COMPLETED: "slate", CANCELLED: "red" } as const;
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
@@ -141,7 +143,8 @@ export function AppointmentsPage() {
           <div className="space-y-4">
             <Field label="Facility" required>
               <Select value={form.facilityId} onChange={e => setForm(f => ({ ...f, facilityId: e.target.value }))}>
-                {(facQ.data ?? []).filter(f => f.type === "PHC" || f.type === "CHC").map(f => <option key={f.id} value={f.id}>{f.name} · {f.village}</option>)}
+                <option value="">Select facility…</option>
+                {(facQ.data ?? []).map(f => <option key={f.id} value={f.id}>{f.name} · {f.village}</option>)}
               </Select>
             </Field>
             <div className="grid grid-cols-2 gap-3">
@@ -241,7 +244,8 @@ function Wave({ on }: { on: boolean }) {
 function TeleRoom({ tele, onClose }: { tele: Teleconsultation; onClose: () => void }) {
   const { user } = useAuth();
   const { toast } = useToast();
-  const isDoctor = user!.role !== "PATIENT";
+  const CLINICAL_ROLES = ["PHC_DOCTOR", "CHC_DOCTOR", "SPECIALIST"];
+  const isDoctor = user ? CLINICAL_ROLES.includes(user.role) : false;
   const [mic, setMic] = useState(true);
   const [cam, setCam] = useState(true);
   const [elapsed, setElapsed] = useState(0);
@@ -272,10 +276,10 @@ function TeleRoom({ tele, onClose }: { tele: Teleconsultation; onClose: () => vo
   return (
     <Modal open onClose={onClose} title={<span className="inline-flex items-center gap-2"><Video className="h-5 w-5 text-brand-600" /> Room {tele.roomCode}</span>} wide>
       <div className="grid gap-3 sm:grid-cols-2">
-        {[{ name: user!.name, sub: isDoctor ? "Specialist" : "Patient", self: true }, { name: isDoctor ? "Patient (video link)" : tele.doctorName, sub: isDoctor ? "From village via ASHA device" : tele.specialty ?? "Specialist", self: false }].map(tl => (
+        {[{ name: user!.name, sub: isDoctor ? "Specialist" : "Patient", self: true }, { name: isDoctor ? (getDB().patients.find(p => p.id === tele.patientId)?.name ?? "Patient") : tele.doctorName, sub: isDoctor ? "From village via ASHA device" : tele.specialty ?? "Specialist", self: false }].map(tl => (
           <div key={tl.name} className="relative flex aspect-video flex-col items-center justify-center overflow-hidden rounded-xl bg-brand-950 text-white">
             <div className="anim-breathe flex h-16 w-16 items-center justify-center rounded-full bg-brand-700 font-display text-xl font-bold">{tl.name.split(" ").map(w => w[0]).slice(0, 2).join("")}</div>
-            {cam || tl.self ? null : <CameraOff className="absolute h-8 w-8 text-slate-500" />}
+            {!cam && tl.self ? <CameraOff className="absolute h-8 w-8 text-slate-500" /> : null}
             <div className="absolute bottom-2 left-3 flex items-center gap-2 text-xs font-semibold">
               {tl.self ? <Wave on={mic} /> : <Wave on={true} />}
               {tl.name}
@@ -312,12 +316,17 @@ export function TelePage() {
   const { toast } = useToast();
   const tlQ = useApi(() => api.listTele(user as never), [user?.id]);
   const [room, setRoom] = useState<Teleconsultation | null>(null);
-  const isDoctor = user!.role !== "PATIENT";
+  const isDoctor = user ? ["PHC_DOCTOR", "CHC_DOCTOR", "SPECIALIST"].includes(user.role) : false;
 
   const join = async (tc: Teleconsultation) => {
     if (tc.status === "SCHEDULED" && isDoctor) {
-      await api.startTele(user as never, tc.id);
-      toast("Consultation started.", "info");
+      try {
+        await api.startTele(user as never, tc.id);
+        toast("Consultation started.", "info");
+      } catch (e) {
+        toast(e instanceof Error ? e.message : "Could not start session.", "error");
+        return;
+      }
     }
     setRoom({ ...tc, status: "IN_PROGRESS" });
   };
@@ -333,10 +342,10 @@ export function TelePage() {
         <Card key={tc.id}>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
-              <Avatar name={isDoctor ? (tc.patientId ? "Patient" : tc.doctorName) : tc.doctorName} className="bg-brand-800" />
+              <Avatar name={isDoctor ? (getDB().patients.find(p => p.id === tc.patientId)?.name ?? "Patient") : tc.doctorName} className="bg-brand-800" />
               <div>
                 <p className="text-sm font-bold text-brand-950">
-                  {isDoctor ? getDB().patients.find(p => p.id === tc.patientId)?.name ?? tc.patientId : tc.doctorName} {tc.specialty ? `· ${tc.specialty}` : ""}
+                  {isDoctor ? getDB().patients.find(p => p.id === tc.patientId)?.name ?? "Patient" : tc.doctorName} {tc.specialty ? `· ${tc.specialty}` : ""}
                 </p>
                 <p className="text-xs text-slate-500">{fmtDT(tc.scheduledAt)} · Room <span className="font-mono font-bold">{tc.roomCode}</span> · {facilityName(tc.facilityId)}</p>
               </div>

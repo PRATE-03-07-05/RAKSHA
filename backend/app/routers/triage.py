@@ -57,13 +57,16 @@ def respiratory_risk(body: TriageRequest, user: CurrentUser, db: DB):
 
 @router.post("/assessments/{assessment_id}/confirm", response_model=TriageResponse,
              summary="Clinician confirms an AI-assisted assessment",
-             dependencies=[Depends(require_roles(*ASSESSORS))])
+             dependencies=[Depends(require_roles(*CLINICAL))])
 def confirm_assessment(assessment_id: str, user: CurrentUser, db: DB):
     a = db.get(Assessment, assessment_id)
     if a is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment not found")
     if a.confirmed:
         raise HTTPException(status.HTTP_409_CONFLICT, "Assessment already confirmed")
+    # Prevent self-confirmation: the confirmer must differ from the creator is
+    # not tracked on Assessment, so at minimum require a clinical role (enforced
+    # by require_roles above) — field workers can no longer confirm.
     a.confirmed = True
     a.confirmed_by_id = user.id
     a.confirmed_at = datetime.now(timezone.utc)
@@ -84,21 +87,23 @@ def confirm_assessment(assessment_id: str, user: CurrentUser, db: DB):
 
 @router.get("/assessments/latest", response_model=list[AssessmentOut],
             summary="Latest assessment per patient (decision-support flags)")
-def latest_assessments(_: CurrentUser, db: DB, patient_id: str | None = None):
-    q = select(Assessment).order_by(Assessment.created_at.asc())
+def latest_assessments(_: CurrentUser, db: DB, patient_id: str | None = None,
+                       limit: int = 100):
+    from sqlalchemy import func as _func
+    # Latest per patient via MAX(created_at) — no full-table Python loop.
+    sub = select(Assessment.patient_id, _func.max(Assessment.created_at).label("mx")).group_by(Assessment.patient_id)
     if patient_id:
-        q = q.where(Assessment.patient_id == patient_id)
-    latest: dict[str, Assessment] = {}
-    for a in db.execute(q).scalars():
-        latest[a.patient_id] = a
+        sub = sub.where(Assessment.patient_id == patient_id)
+    sub = sub.subquery()
+    q = select(Assessment).join(sub, (Assessment.patient_id == sub.c.patient_id) &
+                                (Assessment.created_at == sub.c.mx)).order_by(Assessment.created_at.desc()).limit(limit)
     outs: list[AssessmentOut] = []
-    for a in latest.values():
+    for a in db.execute(q).scalars():
         out = AssessmentOut.model_validate(a)
         if a.confirmed_by_id:
             cb = db.get(User, a.confirmed_by_id)
             out.confirmed_by_name = cb.name if cb else None
         outs.append(out)
-    outs.sort(key=lambda o: o.created_at, reverse=True)
     return outs
 
 

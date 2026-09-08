@@ -8,11 +8,19 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r /app/requirements.txt || pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY app ./app
+COPY ml ./ml
+COPY migrations ./migrations
+COPY alembic.ini .
+COPY seed.py .
+COPY entrypoint.sh .
 
 # Normalize line endings (repo is edited on Windows) and make the startup
 # script executable. `sh entrypoint.sh` is used so the shebang is irrelevant.
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
+
+RUN useradd -m raksha && chown -R raksha:raksha /app
+USER raksha
 
 EXPOSE 8000
 
