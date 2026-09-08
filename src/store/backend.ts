@@ -1042,7 +1042,7 @@ export const api = {
     const [an, bn, refsRaw] = await Promise.all([
       rq<AnyObj>("GET", "/admin/analytics"),
       rq<AnyObj[]>("GET", "/admin/bottlenecks"),
-      rq<AnyObj>("GET", "/referrals?limit=500"),
+      rq<AnyObj>("GET", "/referrals?limit=200"),
     ]);
     const refs = (refsRaw.items ?? []) as AnyObj[];
     if (!cache.facilities.length) await loadFacilities().catch(() => undefined);
