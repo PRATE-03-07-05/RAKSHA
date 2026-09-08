@@ -12,16 +12,17 @@ export const API_BASE: string =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ??
   "http://localhost:8000";
 
-import { getToken as platformGetToken, setToken as platformSetToken } from "../platform/token";
-
 export const TOKEN_KEY = "raksha.session.v1";
 
 export function getToken(): string | null {
-  return platformGetToken();
+  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
 }
 
 export function setToken(token: string | null): void {
-  platformSetToken(token);
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch { /* storage unavailable — session simply won't persist */ }
 }
 
 export class ApiError extends Error {
