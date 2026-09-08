@@ -18,7 +18,7 @@ from . import __version__
 from .config import get_settings
 from .database import SessionLocal
 from .routers import (admin, appointments, auth, emergencies, facilities,
-                      notifications, patients, records, referrals, sync,
+                      notifications, patients, qr, records, referrals, sync,
                       triage)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -82,5 +82,6 @@ def health():
 
 for r in (auth.router, patients.router, records.router, referrals.router,
           facilities.router, appointments.router, triage.router,
-          emergencies.router, notifications.router, sync.router, admin.router):
+          emergencies.router, notifications.router, sync.router, admin.router,
+          qr.router):
     app.include_router(r)

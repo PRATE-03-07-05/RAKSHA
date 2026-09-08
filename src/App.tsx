@@ -11,6 +11,7 @@ import { PatientHomePage, AppointmentsPage, ReferralListPage, TelePage, Notifica
 import { FieldDashboard, RegisterPage, PatientsPage, AssessFlow, FollowUpsPage, SyncCenterPage } from "./pages/FieldWorker";
 import { DoctorDashboard, QueuePage, DoctorReferralsPage, ReferralDetailPage, DoctorPatientPage, EmergencyPage } from "./pages/Doctor";
 import { AdminDashboard, FacilitiesPage, BottleneckPage, AuditPage, SettingsPage, AdminReferralsPage, UserManagement } from "./pages/Admin";
+import { QRPatientPage } from "./pages/QRPatientPage";
 import type { Role } from "./lib/types";
 
 const FIELD: Role[] = ["ASHA", "ANM", "PHC_STAFF"];
@@ -88,6 +89,8 @@ export default function App() {
             <Route path="settings" element={<Gate roles={["DISTRICT_ADMIN"]}><SettingsPage /></Gate>} />
             <Route path="profile" element={<ProfilePage />} />
           </Route>
+          {/* Public QR code route - no authentication required */}
+          <Route path="/qr/patient/:patientId" element={<QRPatientPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>

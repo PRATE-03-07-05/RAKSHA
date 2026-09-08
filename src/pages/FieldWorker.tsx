@@ -9,7 +9,8 @@ import {
 import { api, getDB, facilityName, followUpState, isOverdue } from "../store/backend";
 import { SYMPTOM_OPTIONS, type TriageInput } from "../lib/triage";
 import { useAuth, useApi, useConn, useI18n, useToast } from "../store/providers";
-import { Card, StatCard, Pill, RiskBadge, RefStatusBadge, Btn, Input, Field, Select, Textarea, Spinner, EmptyState, QRCard, Banner, KV, SectionHead, Avatar, Progress } from "../components/ui";
+import { Card, StatCard, Pill, RiskBadge, RefStatusBadge, Btn, Input, Field, Select, Textarea, Spinner, EmptyState, Banner, KV, SectionHead, Avatar, Progress } from "../components/ui";
+import { QRCode } from "../components/QRCode";
 import type { Patient, Assessment, Referral } from "../lib/types";
 import { fmtD, fmtDT, relTime, todayISO, cx, daysUntil, ageFrom } from "../lib/utils";
 
@@ -193,8 +194,8 @@ export function RegisterPage() {
             <p className="font-display text-lg font-extrabold text-brand-950">{done.name}</p>
             <p className="text-xs text-slate-500">{done.age} yrs · {done.gender.toLowerCase()} · {done.village}</p>
             <p className="mt-2 font-mono text-sm font-bold tracking-wider text-brand-700">{done.rakId}</p>
-            <div className="mt-3 flex justify-center"><QRCard text={done.rakId} size={132} /></div>
-            <p className="mt-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">RAKSHA patient ID · demo QR</p>
+            <div className="mt-3 flex justify-center"><QRCode value={`${window.location.origin}/qr/patient/${done.id}`} size={132} /></div>
+            <p className="mt-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Scan to view patient info</p>
           </div>
           <div className="mt-5 flex justify-center gap-2">
             <Btn variant="secondary" onClick={() => { setDone(null); setF({ name: "", dob: "", gender: "FEMALE", phone: "", village: user?.village ?? "", address: "", emergencyContact: "", emergencyPhone: "", conditions: [], allergies: "", pregnant: false, consent: false }); }}><UserPlus className="h-4 w-4" /> Register another</Btn>
